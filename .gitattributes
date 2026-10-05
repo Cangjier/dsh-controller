@@ -1,0 +1,17 @@
+# Line endings, explicit rather than left to core.autocrlf.
+#
+# This repository was authored on Windows with autocrlf=true, where every checkout rewrote every file and the
+# diff for a one-line change became the whole file — worst of all in the Chinese documents, which are the bulk
+# of the prose here. Storing LF and checking out LF makes the diff describe the change again.
+* text=auto eol=lf
+
+# `src/ui/desktop.ps1` starts with a UTF-8 BOM on purpose (see the README): Windows PowerShell 5.1 reads a
+# BOM-less script in the system ANSI code page, which mangles the Chinese strings inside. `eol=lf` keeps the
+# BOM at the top of the file where it belongs; nothing here may rewrite it.
+*.ps1  text eol=lf
+
+# Images and archives, should they ever be force-added. They are gitignored; this is the second line of
+# defence, so a binary can never be text-mangled by a checkout.
+*.png  binary
+*.jpg  binary
+*.zip  binary

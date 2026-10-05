@@ -1,0 +1,48 @@
+# dsh-controller bundle patch.
+#
+# 它只贡献一行，且不依赖任何特定 composition：
+#
+#   controller  Host 插件：注册 `dsh_*` 工具，用来控制 DSH 自身。
+#               需要 `tools` 服务；DSH 的其余服务（agents / sessions /
+#               sessionController / pluginManager / …）都是**可选**的，
+#               运行期逐个探测：有就走 API，没有就退回桌面自动化并在结果里说明。
+#
+# `name` 是**模块说明符**，不是展示名：它按「DSH 安装目录 → profile 目录」
+# 两个锚点解析，所以必须写成装进 profile 的那个包名 `dsh-controller`。
+#
+# 配置分三类：
+#   - api:  API 路径的偏好（是否允许在 API 可用时仍然强制走 UI；等待空闲的超时）
+#   - ui:   桌面自动化回退（PowerShell 超时、截图目录、DSH 窗口标题匹配）
+#   - guard: 危险动作的门槛（创建会话 / 安装插件是否必须显式确认）
+
+- insert:
+    - id: controller
+      name: 'dsh-controller'
+      config:
+        # 总开关。false = 不注册任何工具（插件仍在树里，但模型看不到 dsh_*）。
+        enabled: true
+
+        api:
+          # 允许在 API 可用时强制走桌面自动化（排查 API 路径时用）。null = 不允许，
+          # 也就是每个动作都优先 API —— 这是本插件的默认主张。
+          forceUi: false
+          # `dsh_sessions {action:"wait"}` 的默认等待上限（毫秒）。
+          defaultWaitMs: 120000
+          # 动作级超时（毫秒）：创建/投递/中止这类调用不会无限等。
+          actionTimeoutMs: 30000
+
+        ui:
+          # DSH 桌面窗口的标题匹配（大小写不敏感的子串）。null = 用进程名匹配。
+          windowTitle: null
+          # 截图落地目录。null = <插件目录>/tmp/screens
+          screenshotDir: null
+          # 单个 PowerShell 动作的超时（毫秒）。
+          scriptTimeoutMs: 60000
+          # 注入按键前的等待，给窗口前台化留时间（毫秒）。
+          focusSettleMs: 120
+
+        guard:
+          # true = `dsh_sessions {action:"create"}` 必须带 confirm:true 才真的建会话。
+          requireConfirmForCreate: false
+          # true = `dsh_plugins {action:"install"|"uninstall"|"enable"|"disable"}` 必须带 confirm:true。
+          requireConfirmForPlugins: true
