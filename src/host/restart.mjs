@@ -56,7 +56,7 @@ export function planPath() {
 
 /** 看门狗日志。 */
 export function watcherLogPath() {
-  return join(controllerStateDir(), 'restart-watch.log')
+  return join(controllerStateDir(), 'relaunch-watch.log')
 }
 
 /** 确保状态目录存在，返回它。 */
