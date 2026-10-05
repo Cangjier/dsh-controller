@@ -8,6 +8,35 @@ import { adapter, probe, userMessage } from '../src/host/services.mjs'
 import { hostIdentity } from '../src/host/restart.mjs'
 import { normalizeConfig } from '../index.mjs'
 
+/**
+ * 每一次 adapter 都带上一根「托盘退出的替身」。
+ *
+ * 优雅退出那一腿会真的动鼠标、真的把宿主应用关掉：一条没有注入它的 restartHost 用例，跑起来就等于
+ * 关掉正在跑测试的这个应用。2026-10-05 真的发生过一次——`node --test "tests/*.test.mjs"` 悬停、
+ * 右键、读菜单、点确认，应用在 21:13:50 退出，那一轮测试也跟着没了。所以替身放在这里，而不是指望
+ * 每一条用例自己记得注入。运行时另有一道守卫（`testRunRefusal`）兜底，两道都留着。
+ *
+ * 需要断言这一腿的用例可以读 `quitCalls`；需要另造行为的用例照旧自己传 `deps.quitViaTray`，
+ * 它排在展开的后面，会覆盖这个替身。
+ */
+const quitCalls = []
+const safeAdapter = (ctx, config, deps = {}) => adapter(ctx, config, {
+  quitViaTray: async (spec) => {
+    quitCalls.push(spec)
+    return {
+      attempted: true,
+      clicked: true,
+      item: { text: spec?.item ?? '退出' },
+      at: { x: 0, y: 0 },
+      menuClosed: true,
+      mode: 'matched',
+      attempts: [],
+      elapsedMs: 0,
+    }
+  },
+  ...deps,
+})
+
 /** 造一段和会话日志同构的字节：若干独立 zstd 帧直接拼接（和 sessionlog.test.mjs 同款）。 */
 function buildLog(frames) {
   return Buffer.concat(frames.map((lines) => zlib.zstdCompressSync(Buffer.from(lines.map((line) => JSON.stringify(line)).join('\n') + '\n', 'utf8'))))
@@ -72,7 +101,7 @@ test('probe 在 ctx.get 抛错时不炸，而是把错误写成证据', () => {
 })
 
 test('listSessions 走 sessionController.list，并把 running 带出来', async () => {
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: { list: () => [
       { sessionId: 'a', running: true, agentAvailable: true, blank: false, cwd: 'C:\\a', updatedAt: 10 },
       { sessionId: 'b', running: false, agentAvailable: false, blank: true, cwd: 'C:\\b', updatedAt: 20 },
@@ -97,7 +126,7 @@ test('listSessions 在没有任何会话服务时退回磁盘，并且明说这�
     ]))
 
     const warnings = []
-    const host = adapter(contextWith({}), normalizeConfig(undefined))
+    const host = safeAdapter(contextWith({}), normalizeConfig(undefined))
     const rows = await host.listSessions({ workspace: 'all' }, warnings)
     assert.equal(rows.length, 1)
     assert.equal(rows[0].source, 'disk:sessions')
@@ -117,7 +146,7 @@ test('getSession 在没有 sessionQuery.readSession 时从磁盘兜底读，而�
       [{ type: 'turn/start', seq: 1, data: { turn: 1 } }],
     ]))
 
-    const host = adapter(contextWith({}), normalizeConfig(undefined))
+    const host = safeAdapter(contextWith({}), normalizeConfig(undefined))
     const detail = await host.getSession({ sessionId: 'session-disk', tail: 5 })
     assert.equal(detail.sessionId, 'session-disk')
     assert.equal(detail.events.length, 2, '磁盘兜底要把事件读出来')
@@ -133,7 +162,7 @@ test('listSessions 的磁盘富化只发生在要返回的行上（先裁剪、�
     writeFileSync(join(workspaceDir, 'session-newest', 'session.v4.jsonl.zstd'), buildLog([
       [{ type: 'turn/start', seq: 1, data: { turn: 1 } }],
     ]))
-    const host = adapter(contextWith({
+    const host = safeAdapter(contextWith({
       sessionController: {
         list: () => [
           { sessionId: 'session-newest', running: false, blank: false, cwd: 'C:\\w', updatedAt: 30 },
@@ -182,7 +211,7 @@ test('listSessions 不按条调用 sessionQuery.readTitle：标题从投影缓�
     }))
 
     let readTitleCalls = 0
-    const host = adapter(contextWith({
+    const host = safeAdapter(contextWith({
       sessionQuery: {
         listSessions: () => [
           { header: { id: 'session-a', cwd: 'C:\\w', createdAt: 20 } },
@@ -205,7 +234,7 @@ test('listSessions 不按条调用 sessionQuery.readTitle：标题从投影缓�
 test('sendToSession 投递一条 user 消息并确认落盘', async () => {
   const agent = fakeAgent()
   let flushed = null
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: { resolveAgent: async () => ({ agent }) },
     sessions: { flush: async (session) => { flushed = session.id; return true } },
   }), normalizeConfig(undefined))
@@ -222,7 +251,7 @@ test('sendToSession 投递一条 user 消息并确认落盘', async () => {
 
 test('sendToSession 的三种模式走三个不同的方法', async () => {
   const agent = fakeAgent()
-  const host = adapter(contextWith({ sessionController: { resolveAgent: async () => ({ agent }) } }), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({ sessionController: { resolveAgent: async () => ({ agent }) } }), normalizeConfig(undefined))
   await host.sendToSession({ sessionId: 's', text: 'a', mode: 'steer' })
   await host.sendToSession({ sessionId: 's', text: 'b', mode: 'inject' })
   assert.equal(agent.steerCalls.length, 1)
@@ -231,13 +260,13 @@ test('sendToSession 的三种模式走三个不同的方法', async () => {
 })
 
 test('sendToSession 把 resolveAgent 的 error 变成可读的异常，而不是静默', async () => {
-  const host = adapter(contextWith({ sessionController: { resolveAgent: async () => ({ error: { message: '写锁被占' } }) } }), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({ sessionController: { resolveAgent: async () => ({ error: { message: '写锁被占' } }) } }), normalizeConfig(undefined))
   await assert.rejects(() => host.sendToSession({ sessionId: 's', text: 'x' }), /写锁被占/)
 })
 
 test('abortSession 用宿主自己的取消口径 cancel({kind:"user"})', async () => {
   const agent = fakeAgent()
-  const host = adapter(contextWith({ agents: { get: () => agent } }), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({ agents: { get: () => agent } }), normalizeConfig(undefined))
   await host.abortSession({ sessionId: 's' })
   assert.deepEqual(agent.cancelCalls[0].cause, { kind: 'user' })
   assert.equal(agent.cancelCalls[0].options, undefined)
@@ -246,13 +275,13 @@ test('abortSession 用宿主自己的取消口径 cancel({kind:"user"})', async 
 })
 
 test('abortSession 对没有 live agent 的会话明确拒绝', async () => {
-  const host = adapter(contextWith({ agents: { get: () => undefined } }), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({ agents: { get: () => undefined } }), normalizeConfig(undefined))
   await assert.rejects(() => host.abortSession({ sessionId: 'cold' }), /没有 live agent/)
 })
 
 test('waitIdle 把超时当结果返回，而不是抛错', async () => {
   const running = fakeAgent({ status: 'running', idlePromise: new Promise(() => {}) })
-  const host = adapter(contextWith({ agents: { get: () => running } }), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({ agents: { get: () => running } }), normalizeConfig(undefined))
   const result = await host.waitIdle({ sessionId: 's', timeoutMs: 30 })
   assert.equal(result.reason, 'timeout')
   assert.equal(result.state, 'RUNNING')
@@ -261,7 +290,7 @@ test('waitIdle 把超时当结果返回，而不是抛错', async () => {
 
 test('waitIdle 对已经空闲的会话立刻返回', async () => {
   const idle = fakeAgent({ status: 'idle' })
-  const host = adapter(contextWith({ agents: { get: () => idle } }), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({ agents: { get: () => idle } }), normalizeConfig(undefined))
   const result = await host.waitIdle({ sessionId: 's' })
   assert.equal(result.reason, 'already-idle')
   assert.equal(result.state, 'IDLE')
@@ -280,7 +309,7 @@ function fakeDesktop(script) {
 test('createSession 用 sessionController.create + resolveAgent + followup', async () => {
   const agent = fakeAgent({ id: 'session-new' })
   const created = []
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: {
       create: async (request) => { created.push(request); return { sessionId: request.sessionId ?? 'session-new', agentPreset: 'standard' } },
       resolveAgent: async () => ({ agent }),
@@ -297,14 +326,14 @@ test('createSession 用 sessionController.create + resolveAgent + followup', asy
 })
 
 test('createSessionViaApi 在没有会话服务时拒绝，而不是偷偷去点 GUI', async () => {
-  const host = adapter(contextWith({}), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({}), normalizeConfig(undefined))
   await assert.rejects(() => host.createSessionViaApi({ text: 'x', cwd: 'C:\\w' }), /无法新建会话/)
 })
 
 test('createSession 默认先试 GUI，GUI 失败才退回 API，并把原因写进 fallback', async () => {
   const agent = fakeAgent({ id: 'session-api' })
   const desktop = fakeDesktop(() => ({ ok: false, reason: 'window-not-found' }))
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: {
       create: async () => ({ sessionId: 'session-api' }),
       resolveAgent: async () => ({ agent }),
@@ -329,7 +358,7 @@ test('createSession 的 GUI 路成功时一个 API 建会话都不调，会话�
     if (action === 'window') return { ok: true, target: { handle: 1, title: 'DeepSeek Harness' } }
     return { ok: true, clicked: true, submitted: true, method: 'sendinput-unicode', sentChars: 3, pointerRestored: true }
   })
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: {
       // 只有列表和投递可用；`create` 一旦被调用就说明路由错了。
       list: async () => {
@@ -362,7 +391,7 @@ test('GUI 建出了会话但第一条消息没送进去时，改由 API 投递�
     if (callIndex === 2) return { ok: true, clicked: true } // 只是点开，不带 submit
     return { ok: false, reason: 'text-not-delivered', sentChars: 0 }
   })
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: {
       list: async () => {
         listed += 1
@@ -384,7 +413,7 @@ test('GUI 建出了会话但第一条消息没送进去时，改由 API 投递�
 test('createSession 在 via:"api" 时完全不碰 GUI', async () => {
   const agent = fakeAgent({ id: 'session-api' })
   const desktop = fakeDesktop(() => { throw new Error('via:"api" 不该碰桌面通道') })
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: {
       create: async () => ({ sessionId: 'session-api' }),
       resolveAgent: async () => ({ agent }),
@@ -399,7 +428,7 @@ test('createSession 在 via:"api" 时完全不碰 GUI', async () => {
 
 test('createSession 在 via:"gui" 时宁可失败也不偷偷用 API', async () => {
   const desktop = fakeDesktop(() => ({ ok: false, reason: 'window-not-found' }))
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: {
       create: async () => { throw new Error('via:"gui" 不该回退到 API') },
       resolveAgent: async () => ({ agent: fakeAgent({ id: 'session-api' }) }),
@@ -410,7 +439,7 @@ test('createSession 在 via:"gui" 时宁可失败也不偷偷用 API', async () 
 })
 
 test('pluginAction 在没有 pluginManager 时拒绝，并说明原因', async () => {
-  const host = adapter(contextWith({}), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({}), normalizeConfig(undefined))
   await assert.rejects(() => host.pluginAction('list', {}), /没有 pluginManager 服务/)
 })
 
@@ -422,7 +451,7 @@ test('pluginAction list 与 enable 分别打到 listPlugins 和 setPluginEnabled
     setPluginEnabled: async (id, enabled) => { calls.push(`setPluginEnabled:${id}:${enabled}`); return { changed: true, application: 'applied' } },
     setBundleEnabled: async (name, enabled) => { calls.push(`setBundleEnabled:${name}:${enabled}`); return { changed: true, application: 'restart-required' } },
   }
-  const host = adapter(contextWith({ pluginManager: manager }), normalizeConfig(undefined))
+  const host = safeAdapter(contextWith({ pluginManager: manager }), normalizeConfig(undefined))
 
   const list = await host.pluginAction('list', {})
   assert.equal(list.plugins.length, 1)
@@ -451,7 +480,7 @@ test('pluginLog 读 profile 下 .plugin-manager/logs，按时间倒序', () => {
     writeFileSync(join(newer, 'pnpm.log'), '+ dsh-controller link:C:\\Users\\Admin\\Documents\\GitHub\\dsh-plugins\\dsh-controller\n')
     process.env.DSH_PROFILE_DIR = profile
 
-    const host = adapter(contextWith({}), normalizeConfig(undefined))
+    const host = safeAdapter(contextWith({}), normalizeConfig(undefined))
     const result = host.pluginLog({ limit: 2 })
     assert.equal(result.transport, 'disk')
     assert.ok(result.entries.length >= 1)
@@ -494,7 +523,7 @@ function twoRunningSessions() {
 
 test('pauseAll 中止所有在跑的会话，但把调用者自己那条留在 deferred 里', async () => {
   const { ctx, agents } = twoRunningSessions()
-  const host = adapter(ctx, normalizeConfig(undefined))
+  const host = safeAdapter(ctx, normalizeConfig(undefined))
 
   const result = await host.pauseAll({ callerSessionId: 'session-a' })
   assert.equal(result.transport, 'api')
@@ -508,7 +537,7 @@ test('pauseAll 中止所有在跑的会话，但把调用者自己那条留在 d
 
 test('pauseAll 的 keepInbox 一路传到 agent.cancel', async () => {
   const { ctx, agents } = twoRunningSessions()
-  const host = adapter(ctx, normalizeConfig(undefined))
+  const host = safeAdapter(ctx, normalizeConfig(undefined))
   await host.pauseAll({ keepInbox: true })
   assert.deepEqual(agents.get('session-b').cancelCalls[0].options, { keepInbox: true })
   assert.deepEqual(agents.get('session-a').cancelCalls[0].options, { keepInbox: true })
@@ -519,7 +548,7 @@ test('restartHost：计划先落盘、延时脚本先起来、交接是延迟的
   const written = []
   const timers = []
   const specs = []
-  const host = adapter(ctx, normalizeConfig(undefined), {
+  const host = safeAdapter(ctx, normalizeConfig(undefined), {
     probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', commandLine: '"C:\\app\\DeepSeek Harness.exe"', evidence: '父进程 11368 是 DeepSeek Harness' }),
     startRelauncher: (spec) => { specs.push(spec); return { pid: 4242, method: 'wmi', logPath: 'C:\\state\\relaunch-watch.log', script: 'relaunch-watch.ps1', shell: 'powershell.exe' } },
     writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
@@ -554,7 +583,15 @@ test('restartHost：计划先落盘、延时脚本先起来、交接是延迟的
   assert.deepEqual(armed.shell.shellPid, 11368)
   assert.deepEqual(armed.shell.hostPid, 4242)
   assert.equal(armed.shell.mainPid, undefined, '旧字段名不该再出现')
-  assert.deepEqual(specs, [{ shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', waitSeconds: 120, settleMs: 1500, killAfterSeconds: 10 }])
+  // 看门狗的强杀宽限 = 原本的 10 秒 + 优雅退出的预算（默认 60 秒）。少于这个数，它会在托盘点击
+  // 落地之前就把进程树收掉，「优雅退出」就成了一句空话。
+  assert.deepEqual(specs, [{ shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', waitSeconds: 120, settleMs: 1500, killAfterSeconds: 70 }])
+  // `exit` 是最后一步才补上的，所以要看最后一份计划，而不是那份 `armed` 快照。
+  const withExit = written.at(-1)
+  assert.equal(withExit.exit.graceful.enabled, true)
+  assert.equal(withExit.exit.graceful.iconName, 'DeepSeek Harness', '图标名默认取要拉起的那个 exe 的文件名')
+  assert.equal(withExit.exit.graceful.budgetMs, 60_000)
+  assert.equal(withExit.exit.graceful.killAfterSeconds, 70, '计划里要能读出「看门狗等多久」是从哪儿来的')
 
   // 交接必须是延迟的：立刻收尾，调用方就永远看不到这个结果。
   assert.equal(timers.length, 1)
@@ -564,6 +601,91 @@ test('restartHost：计划先落盘、延时脚本先起来、交接是延迟的
   for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
   assert.equal(agents.get('session-a').cancelCalls.length, 1, '交接前一刻才收调用者')
   assert.ok(written.at(-1).exit.handedOffAt !== undefined, '「已交接」要留痕，否则事后分不清没走到和交接了没人响应')
+  // 请应用自己退出那一腿必须真的被叫到，而且叫的是替身。这条用例原先没有注入 deps.quitViaTray，于是
+  // 它真的去悬停、右键、读菜单、点确认，把正在跑测试的这个应用关掉过一次——这一腿发生在交接的定时器里，
+  // 所以断言必须放在定时器跑完之后，否则看到的是「还没叫」而不是「没叫」。
+  assert.deepEqual(quitCalls.map((call) => call.iconName), ['DeepSeek Harness'])
+  assert.equal(quitCalls[0].budgetMs, 60_000)
+  assert.equal(quitCalls[0].item, '退出')
+})
+
+test('restartHost 交接时会先请应用自己退出，并把这一腿的结论写进计划', async () => {
+  const { ctx } = twoRunningSessions()
+  const written = []
+  const timers = []
+  const attempts = []
+  const host = safeAdapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', commandLine: null, evidence: 'x' }),
+    startRelauncher: () => ({ pid: 4242, method: 'wmi', logPath: 'log', script: 's', shell: 'powershell.exe' }),
+    writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
+    later: (fn, ms) => { timers.push({ fn, ms }); return { unref() {} } },
+    now: () => 1_000_000,
+    quitViaTray: async (spec) => {
+      attempts.push(spec)
+      return { attempted: true, clicked: true, specifier: 'file:///.../dsh-computer-use/src/core/index.mjs', icon: { name: null, menuItems: ['打开 DeepSeek Harness', '退出 DeepSeek Harness'], point: { x: 2105, y: 1487 } }, item: { text: '退出 DeepSeek Harness', at: { x: 2279, y: 1437 } }, menuClosed: true, elapsedMs: 21_000, attempts: [] }
+    },
+  })
+
+  await host.restartHost({ callerSessionId: 'session-a' })
+  timers[0].fn()
+  for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(attempts.length, 1, '交接之后要真的去点托盘菜单')
+  assert.equal(attempts[0].iconName, 'DeepSeek Harness')
+  assert.equal(attempts[0].item, '退出')
+  assert.equal(attempts[0].budgetMs, 60_000)
+  const last = written.at(-1)
+  assert.equal(last.exit.graceful.enabled, true)
+  assert.equal(last.exit.graceful.clicked, true)
+  assert.equal(last.exit.graceful.item.text, '退出 DeepSeek Harness')
+  assert.equal(last.exit.graceful.menuClosed, true)
+  assert.ok(last.exit.gracefulFinishedAt !== undefined, '这一腿跑完了也要留痕')
+})
+
+test('优雅退出失败不影响结局：看门狗照样到点收树', async () => {
+  const { ctx } = twoRunningSessions()
+  const written = []
+  const timers = []
+  const specs = []
+  const host = safeAdapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', commandLine: null, evidence: 'x' }),
+    startRelauncher: (spec) => { specs.push(spec); return { pid: 4242, method: 'wmi', logPath: 'log', script: 's', shell: 'powershell.exe' } },
+    writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
+    later: (fn, ms) => { timers.push({ fn, ms }); return { unref() {} } },
+    now: () => 1_000_000,
+    quitViaTray: async () => ({ attempted: true, clicked: false, reason: '托盘里没有名字匹配 "DeepSeek Harness" 的图标', elapsedMs: 30_000, attempts: [] }),
+  })
+
+  const result = await host.restartHost({})
+  assert.match(result.note, /请它自己退出/)
+  assert.equal(specs[0].killAfterSeconds, 70, '优雅退出的预算要算进看门狗的宽限')
+
+  timers[0].fn()
+  for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(written.at(-1).exit.graceful.clicked, false)
+  assert.match(written.at(-1).exit.graceful.reason, /没有名字匹配/)
+})
+
+test('gracefulQuit = false 时回到老行为：直接交给看门狗，宽限不加预算', async () => {
+  const { ctx } = twoRunningSessions()
+  const specs = []
+  const timers = []
+  let trayCalls = 0
+  const host = safeAdapter(ctx, normalizeConfig({ restart: { gracefulQuit: false } }), {
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\x.exe', commandLine: null, evidence: 'x' }),
+    startRelauncher: (spec) => { specs.push(spec); return { pid: 1, method: 'wmi', logPath: 'log', script: 's', shell: 'powershell.exe' } },
+    writePlan: (plan) => plan,
+    later: (fn, ms) => { timers.push({ fn, ms }); return { unref() {} } },
+    now: () => 1_000_000,
+    quitViaTray: async () => { trayCalls += 1; return { attempted: true, clicked: true } },
+  })
+
+  const result = await host.restartHost({})
+  assert.equal(specs[0].killAfterSeconds, 10)
+  assert.deepEqual(result.gracefulExit, { enabled: false, reason: 'config.restart.gracefulQuit = false：直接交给看门狗收树' })
+  timers[0].fn()
+  for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(trayCalls, 0, '关掉之后一次都不该点托盘')
 })
 
 test('restartHost 先落 arming 痕迹、再快照，而且同一次调用只扫一遍会话', async () => {
@@ -580,7 +702,7 @@ test('restartHost 先落 arming 痕迹、再快照，而且同一次调用只扫
     },
     agents: { get: () => null },
   })
-  const host = adapter(ctx, normalizeConfig(undefined), {
+  const host = safeAdapter(ctx, normalizeConfig(undefined), {
     probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     startRelauncher: () => ({ pid: 1, method: 'wmi', logPath: 'l', script: 's', shell: 'powershell.exe' }),
     watcherAlive: async () => true,
@@ -599,7 +721,7 @@ test('restartHost 先落 arming 痕迹、再快照，而且同一次调用只扫
 test('restartHost 把两个 pid 和宽限期交给延时脚本（它会等整棵树，必要时收掉它）', async () => {
   const { ctx } = twoRunningSessions()
   const specs = []
-  const host = adapter(ctx, normalizeConfig({ restart: { killAfterSeconds: 25, waitSeconds: 60 } }), {
+  const host = safeAdapter(ctx, normalizeConfig({ restart: { killAfterSeconds: 25, waitSeconds: 60 } }), {
     probeShell: async () => ({ ok: true, shellPid: 5320, hostPid: 18620, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     startRelauncher: (spec) => { specs.push(spec); return { pid: 1, method: 'wmi', logPath: 'l', script: 's', shell: 'powershell.exe' } },
     writePlan: (plan) => plan,
@@ -610,14 +732,15 @@ test('restartHost 把两个 pid 和宽限期交给延时脚本（它会等整棵
   assert.equal(specs.length, 1)
   assert.equal(specs[0].shellPid, 5320)
   assert.equal(specs[0].hostPid, 18620)
-  assert.equal(specs[0].killAfterSeconds, 25)
+  // 25 是配置里写的强杀宽限；优雅退出那一腿的预算（默认 60 秒）另算在上面。
+  assert.equal(specs[0].killAfterSeconds, 85)
   assert.equal(specs[0].waitSeconds, 60)
 })
 
 test('restartHost 的 dryRun 保持纯净：不写任何文件，包括那份 arming 痕迹', async () => {
   const { ctx, agents } = twoRunningSessions()
   const written = []
-  const host = adapter(ctx, normalizeConfig(undefined), {
+  const host = safeAdapter(ctx, normalizeConfig(undefined), {
     probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     writePlan: (plan) => { written.push(plan); return plan },
     startRelauncher: () => { throw new Error('dryRun 不该起延时脚本') },
@@ -635,7 +758,7 @@ test('restartHost 的 dryRun 保持纯净：不写任何文件，包括那份 ar
 test('restartHost 在延时脚本起不来时什么都不动（会话已停的事实要说清）', async () => {
   const { ctx, agents } = twoRunningSessions()
   const written = []
-  const host = adapter(ctx, normalizeConfig(undefined), {
+  const host = safeAdapter(ctx, normalizeConfig(undefined), {
     probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     startRelauncher: () => { throw new Error('powershell 起不来') },
     writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
@@ -650,7 +773,7 @@ test('restartHost 在延时脚本起不来时什么都不动（会话已停的�
 
 test('restartHost 在找不到桌面壳时什么都不做', async () => {
   const { ctx, agents } = twoRunningSessions()
-  const host = adapter(ctx, normalizeConfig(undefined), {
+  const host = safeAdapter(ctx, normalizeConfig(undefined), {
     probeShell: async () => ({ ok: false, shellPid: 1, hostPid: 4242, exe: null, reason: '跑在 headless 的 dsh CLI 里' }),
     startRelauncher: () => { throw new Error('不该起延时脚本') },
   })
@@ -673,7 +796,7 @@ test('resumeAfterRestart 只在别的进程写的计划上投递，并且先 cla
     sessions: [{ sessionId: 'session-b' }],
     outcomes: [],
   }
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: { resolveAgent: async () => ({ agent }) },
     sessions: { flush: async () => true },
   }), normalizeConfig(undefined), {
@@ -695,7 +818,7 @@ test('resumeAfterRestart 只在别的进程写的计划上投递，并且先 cla
 
 test('resumeAfterRestart 拒绝恢复「当前这个进程」写下的计划', async () => {
   let resolveCalls = 0
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: { resolveAgent: async () => { resolveCalls += 1; return { agent: fakeAgent() } } },
   }), normalizeConfig(undefined), {
     readPlan: () => ({
@@ -713,7 +836,7 @@ test('resumeAfterRestart 拒绝恢复「当前这个进程」写下的计划', a
 
 test('resumeAfterRestart 对过期计划改成 expired，而不是突然把会话全都点着', async () => {
   const written = []
-  const host = adapter(contextWith({ sessionController: { resolveAgent: async () => ({ agent: fakeAgent() }) } }), normalizeConfig({ restart: { planTtlSeconds: 10 } }), {
+  const host = safeAdapter(contextWith({ sessionController: { resolveAgent: async () => ({ agent: fakeAgent() }) } }), normalizeConfig({ restart: { planTtlSeconds: 10 } }), {
     readPlan: () => ({
       plan: { version: 1, state: 'armed', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, resume: { text: 'x' }, sessions: [{ sessionId: 's' }], outcomes: [] },
       path: 'p',
@@ -729,7 +852,7 @@ test('resumeAfterRestart 对过期计划改成 expired，而不是突然把会�
 })
 
 test('resumeAfterRestart 在服务还没装配好时给出可重试的信号', async () => {
-  const host = adapter(contextWith({}), normalizeConfig(undefined), {
+  const host = safeAdapter(contextWith({}), normalizeConfig(undefined), {
     readPlan: () => ({
       plan: { version: 1, state: 'armed', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, resume: { text: 'x' }, sessions: [{ sessionId: 's' }], outcomes: [] },
       path: 'p',
@@ -746,7 +869,7 @@ test('resumeAfterRestart 在服务还没装配好时给出可重试的信号', a
 
 test('resumeAfterRestart 不会拿「停在快照阶段」的 arming 计划去投消息', async () => {
   let deliveries = 0
-  const host = adapter(contextWith({
+  const host = safeAdapter(contextWith({
     sessionController: { resolveAgent: async () => { deliveries += 1; return { agent: fakeAgent() } } },
   }), normalizeConfig(undefined), {
     readPlan: () => ({
@@ -766,7 +889,7 @@ test('resumeAfterRestart 不会拿「停在快照阶段」的 arming 计划去�
 
 test('resumeAfterRestart 把过期的 arming 计划收成 expired，而不是永远留着中间态', async () => {
   const written = []
-  const host = adapter(contextWith({}), normalizeConfig({ restart: { planTtlSeconds: 10 } }), {
+  const host = safeAdapter(contextWith({}), normalizeConfig({ restart: { planTtlSeconds: 10 } }), {
     readPlan: () => ({
       plan: { version: 1, state: 'arming', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, resume: { text: 'x' }, sessions: [], outcomes: [] },
       path: 'p',
@@ -783,7 +906,7 @@ test('resumeAfterRestart 把过期的 arming 计划收成 expired，而不是永
 })
 
 test('restartStatus 把 arming 计划直说成「按了重启但停在快照」', async () => {
-  const host = adapter(contextWith({}), normalizeConfig(undefined), {
+  const host = safeAdapter(contextWith({}), normalizeConfig(undefined), {
     readPlan: () => ({
       plan: { version: 1, state: 'arming', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, shell: {}, stop: {}, sessions: [], outcomes: [] },
       path: 'p',
@@ -799,7 +922,7 @@ test('restartStatus 把 arming 计划直说成「按了重启但停在快照」'
 })
 
 test('restartStatus 在没有计划时说清楚没有，而不是编一个', async () => {
-  const host = adapter(contextWith({}), normalizeConfig(undefined), {
+  const host = safeAdapter(contextWith({}), normalizeConfig(undefined), {
     readPlan: () => ({ plan: null, path: 'C:\\state\\restart-plan.json', error: null }),
   })
   const result = await host.restartStatus()
