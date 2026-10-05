@@ -1009,7 +1009,7 @@ export function adapter(ctx, config, deps = {}) {
     },
 
     /**
-     * 停止所有在跑的会话 → 落盘恢复计划 → 起分离看门狗 → 延迟请求退出。
+     * 停止所有在跑的会话 → 落盘恢复计划 → 起分离看门狗 → 延迟请求关停 → 由看门狗重新拉起应用。
      *
      * 顺序是刻意的，每一步都为了「退出去还回得来」：
      *   - 先证明桌面壳找得到（`probeShell`），否则直接拒绝，绝不先退出去再说；
@@ -1019,6 +1019,10 @@ export function adapter(ctx, config, deps = {}) {
      *   - 计划**先落盘**：退出之后没有任何代码能补写；
      *   - 看门狗**先起来**：它起不来就不请求退出（宁可重启不发生，也不要退出去回不来）；
      *   - 退出是**延迟**的，否则本次工具结果会跟着这一轮一起消失。
+     *
+     * **`requestExit` 关的是 Host 自己，不是桌面应用**（`ctx.appExit` = Host 的关停，实测启动器
+     * 源码如此）：壳会带着一个没有后端的窗口留下来——那就是「重连中」。所以计划里同时记下
+     * `shellPid` 与 `hostPid`，由看门狗等 Host 走完、再请壳关窗（不行就强杀），最后才拉起 exe。
      *
      * 调用者自己那条会话不在立即停止之列，而是在退出前一刻收掉（见 `pauseAll`）。
      * @param {object} args - `{ keepInbox, text, delaySeconds, dryRun, sessionIds, callerSessionId, reason }`。
@@ -1051,7 +1055,9 @@ export function adapter(ctx, config, deps = {}) {
         state: dryRun ? 'dry-run' : 'arming',
         reason: typeof args.reason === 'string' && args.reason !== '' ? args.reason : 'dsh_host {action:"restart"}',
         writer: hostIdentity(),
-        shell: { mainPid: shell.mainPid, exe: shell.exe, commandLine: shell.commandLine ?? null, evidence: shell.evidence ?? null },
+        // 两个 pid 都要记：`hostPid`（本进程——`appExit` 关的就是它）与 `shellPid`（桌面壳——它不会
+        // 跟着退，得由看门狗请它关窗、不行再强杀）。只记壳 pid 的早期版本让看门狗等错了对象。
+        shell: { shellPid: shell.shellPid, hostPid: shell.hostPid, exe: shell.exe, commandLine: shell.commandLine ?? null, evidence: shell.evidence ?? null },
         stop: { keepInbox, requested: 0, cancelled: [], failed: [], deferred: [] },
         resume: { text: resumeText, max: config.restart.maxResume },
         sessions: [],
@@ -1120,10 +1126,12 @@ export function adapter(ctx, config, deps = {}) {
       let watcher
       try {
         watcher = await startWatcher({
-          mainPid: shell.mainPid,
+          shellPid: shell.shellPid,
+          hostPid: shell.hostPid,
           exe: shell.exe,
           timeoutSeconds: config.restart.watcherTimeoutSeconds,
           settleMs: config.restart.settleMs,
+          shellGraceSeconds: config.restart.shellGraceSeconds,
         })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -1144,7 +1152,8 @@ export function adapter(ctx, config, deps = {}) {
       }
       savePlan(plan)
 
-      // 8. 延迟退出：先让本次工具结果送达，再收掉调用者那一轮，最后退出。
+      // 8. 延迟关停：先让本次工具结果送达，再收掉调用者那一轮，最后请求 Host 关停。
+      //    这一句关的是**本进程**：壳会留下来（界面停在「重连中」），所以看门狗那边还等着收尾。
       const delayMs = Math.max(1, delaySeconds) * 1000
       plan.exit = { delaySeconds, scheduledAt: new Date(clock()).toISOString() }
       savePlan(plan)
@@ -1164,6 +1173,9 @@ export function adapter(ctx, config, deps = {}) {
             }
           }
           try {
+            // 记录「请求已经发出」：否则事后无法区分「没走到这一步」和「请求了但没人响应」。
+            plan.exit.requestedAt = new Date(clock()).toISOString()
+            try { savePlan(plan) } catch { /* 写不动就只剩日志 */ }
             requestExit(0)
           } catch (error) {
             plan.state = 'failed'
@@ -1183,7 +1195,7 @@ export function adapter(ctx, config, deps = {}) {
         willResume: sessions,
         resumeText,
         exitInSeconds: delaySeconds,
-        note: `这个进程会在约 ${delaySeconds} 秒后退出，看门狗等它退出后重新拉起应用；重启后插件按计划把这些会话继续起来。`,
+        note: `这个 Host 进程会在约 ${delaySeconds} 秒后关停（ctx.appExit 关的是 Host，不是桌面壳），看门狗等它走后请壳关窗、必要时强杀，然后拉起应用；重启后插件按计划把这些会话继续起来。`,
         warnings,
       }
     },

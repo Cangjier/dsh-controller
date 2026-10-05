@@ -18,6 +18,7 @@ test('空配置得到一套可用的默认值', () => {
   assert.equal(config.guard.requireConfirmForRestart, true)
   assert.equal(config.restart.enabled, true)
   assert.equal(config.restart.delaySeconds, 6)
+  assert.equal(config.restart.shellGraceSeconds, 8)
   assert.equal(config.restart.maxResume, 20)
   assert.equal(config.restart.planTtlSeconds, 900)
   assert.equal(config.restart.keepInbox, false)

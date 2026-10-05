@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import {
   PLAN_VERSION,
+  WATCHER_SCRIPT,
   hostIdentity,
   planPath,
   readLogTail,
@@ -96,11 +97,24 @@ test('同一个进程的两次身份相等，不同 pid 或不同启动时刻都
   assert.ok(!sameBoot(first, undefined))
 })
 
-test('看门狗优先走 WMI：新进程不在 DSH 的进程树里', async () => {
+test('看门狗脚本必须是纯 ASCII 且没有 BOM：5.1 会按系统 ANSI 码页读 BOM-less 的 .ps1', () => {
+  const bytes = readFileSync(WATCHER_SCRIPT)
+  assert.notDeepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf], '带 BOM 的脚本在 5.1 下会多出一个字符')
+  const text = bytes.toString('utf8')
+  const nonAscii = [...text].filter((char) => char.codePointAt(0) > 0x7f)
+  // 实测过一次：一句 UTF-8 中文注释让 5.1 在三行之后报了一个多余的 '}'。这个守护很便宜。
+  assert.equal(nonAscii.length, 0, `看门狗脚本里出现了非 ASCII 字符：${nonAscii.join('')}`)
+  // 两个 pid 是这次修复的核心：脚本必须同时认这两个参数，并且保留旧名字以防旧版 Node 调它。
+  for (const parameter of ['$ShellPid', '$HostPid', '$MainPid', 'CloseMainWindow', 'Stop-Process']) {
+    assert.ok(text.includes(parameter), `看门狗脚本里缺少 ${parameter}`)
+  }
+})
+
+test('看门狗优先走 WMI：新进程不在 DSH 的进程树里，并且拿到两个 pid', async () => {
   await withStateDirAsync(async () => {
     const spawned = []
     const watcher = await spawnWatcher(
-      { mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', timeoutSeconds: 180, settleMs: 1500 },
+      { shellPid: 11368, hostPid: 909, exe: 'C:\\app\\DeepSeek Harness.exe', timeoutSeconds: 180, settleMs: 1500, shellGraceSeconds: 12 },
       {
         shells: () => ['powershell.exe'],
         // WMI 那条路：假装返回了一个活着的 pid。
@@ -110,7 +124,12 @@ test('看门狗优先走 WMI：新进程不在 DSH 的进程树里', async () =>
           const base64 = script.match(/FromBase64String\('([^']+)'\)/)[1]
           const commandLine = Buffer.from(base64, 'base64').toString('utf8')
           assert.match(commandLine, /restart-watch\.ps1/)
+          // 等的是 Host（`ctx.appExit` 关的是它），壳是随后要收尾的那一个。
+          assert.match(commandLine, /-HostPid 909/)
+          assert.match(commandLine, /-ShellPid 11368/)
+          // `-MainPid` 仍然发出，值是壳 pid：加载中的旧版 Node 只会传这一个名字。
           assert.match(commandLine, /-MainPid 11368/)
+          assert.match(commandLine, /-ShellGraceSeconds 12/)
           // exe 路径里有空格，必须被引起来——否则 WMI 收到的是两个参数。
           assert.match(commandLine, /-Exe "C:\\app\\DeepSeek Harness\.exe"/)
           return { stdout: Buffer.from(JSON.stringify({ ok: true, returnValue: 0, pid: 777, alive: true }), 'utf8'), stderr: Buffer.alloc(0) }
@@ -129,7 +148,7 @@ test('看门狗优先走 WMI：新进程不在 DSH 的进程树里', async () =>
 test('WMI 起不来时退回 detached spawn，两条都失败才抛错', async () => {
   await withStateDirAsync(async () => {
     const fallback = await spawnWatcher(
-      { mainPid: 1, exe: 'C:\\app\\a.exe', timeoutSeconds: 5, settleMs: 1 },
+      { shellPid: 1, exe: 'C:\\app\\a.exe', timeoutSeconds: 5, settleMs: 1 },
       {
         shells: () => ['powershell.exe'],
         exec: async () => ({ stdout: Buffer.from(JSON.stringify({ ok: false, error: 'CimCmdlets 不在' }), 'utf8'), stderr: Buffer.alloc(0) }),
@@ -141,7 +160,7 @@ test('WMI 起不来时退回 detached spawn，两条都失败才抛错', async (
     assert.deepEqual(fallback.attempts.map((entry) => entry.ok), [false, true])
 
     await assert.rejects(
-      () => spawnWatcher({ mainPid: 1, exe: 'C:\\app\\a.exe' }, {
+      () => spawnWatcher({ shellPid: 1, exe: 'C:\\app\\a.exe' }, {
         shells: () => ['powershell.exe'],
         exec: async () => ({ stdout: Buffer.from(JSON.stringify({ ok: false, error: 'nope' }), 'utf8'), stderr: Buffer.alloc(0) }),
         spawn: () => { throw new Error('spawn 也不行') },

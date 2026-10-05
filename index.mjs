@@ -164,16 +164,19 @@ export function normalizeConfig(raw) {
       scriptTimeoutMs: optionalPositiveNumber(ui, 'scriptTimeoutMs', DEFAULT_SCRIPT_TIMEOUT_MS, 'config.ui.scriptTimeoutMs'),
       focusSettleMs: optionalPositiveNumber(ui, 'focusSettleMs', 120, 'config.ui.focusSettleMs'),
     },
-    // 重启编排：停止全部会话 → 退出 → 由分离看门狗重新拉起 → 按落盘的计划继续那些会话。
+    // 重启编排：停止全部会话 → 关停 Host → 由分离看门狗请壳关窗/强杀并重新拉起 → 按计划继续会话。
     // 计划放在 `<DSH home>/controller/`，所以「重启前的那个进程」和「重启后的新进程」读的是同一份。
     restart: {
       enabled: optionalBoolean(restart, 'enabled', true, 'config.restart.enabled'),
-      // 请求退出前的延迟：本次工具结果要先送达调用方，所以退出不能是立即的。
+      // 请求关停前的延迟：本次工具结果要先送达调用方，所以关停不能是立即的。
       delaySeconds: optionalPositiveNumber(restart, 'delaySeconds', 6, 'config.restart.delaySeconds'),
-      // 看门狗等主进程退出的上限；到点还没退就放弃，绝不启动第二个实例。
+      // 看门狗等 **Host 子进程**关停的上限；到点还没走就放弃，绝不启动第二个实例。
+      // （`ctx.appExit` 关的就是 Host；桌面壳不会跟着退，由下面那一档收尾。）
       watcherTimeoutSeconds: optionalPositiveNumber(restart, 'watcherTimeoutSeconds', 180, 'config.restart.watcherTimeoutSeconds'),
-      // 主进程退出后再等多久才拉起（让会话日志写完）。
+      // Host 走后再等多久才动桌面壳（让会话日志写完）。
       settleMs: optionalPositiveNumber(restart, 'settleMs', 1500, 'config.restart.settleMs'),
+      // 桌面壳留着不走时：先请它关主窗口，等这么久；还不走就强杀——否则它会和新实例抢同一个 profile。
+      shellGraceSeconds: optionalPositiveNumber(restart, 'shellGraceSeconds', 8, 'config.restart.shellGraceSeconds'),
       // 一次最多自动继续多少条会话：防止一次重启把一大片会话同时点着。
       maxResume: optionalPositiveNumber(restart, 'maxResume', 20, 'config.restart.maxResume'),
       // 计划的有效期：超过它就不恢复了（一个隔夜才被打开的计划不该突然满血复活）。

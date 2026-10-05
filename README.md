@@ -101,15 +101,33 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 6. **看门狗先起来**——它**不属于 DSH 的进程树**：优先用 WMI（`Win32_Process.Create`）起，新进程的父进程
    是 `WmiPrvSE.exe`（实测），所以即使桌面壳用 kill-on-close 的 Job Object 收子进程也带不走它；WMI 不可用
    时才退回 `detached` spawn。它起不来就**不请求退出**：宁可重启没发生，也不要退出去回不来。
-7. **延迟退出**——默认 6 秒后才 `ctx.appExit(0)`，为的就是让上面的结果先送达调用方。退出前还会回读一次
-   看门狗是否还活着（`probeWatcherAlive`），它已经不在了就取消退出——退出去且没人拉起来是最坏的结局。
+7. **延迟关停**——默认 6 秒后才 `ctx.appExit(0)`，为的就是让上面的结果先送达调用方。关停前还会回读一次
+   看门狗是否还活着（`probeWatcherAlive`），它已经不在了就取消——退出去且没人拉起来是最坏的结局。
 
 整个动作的时间预算是 **180s**（探壳 20s + 看门狗 30s + 余量）：比它内部每一步的上限都大，否则会在看门狗
-已经起来之后把结果掐掉，而那时退出还在排队——那正是「按了没反应」的另一种形态。
+已经起来之后把结果掐掉，而那时关停还在排队——那正是「按了没反应」的另一种形态。
 
-看门狗只做一件事：等主进程 PID 消失 → 再等 `settleMs` 让日志写完 → 确认没有同名进程残留 →
-`Start-Process` 拉起 exe。超时还没退，它**放弃并且不启动第二个实例**（退 3），因为两个 DSH 抢同一个
-profile 比重启失败更糟。
+### 两个 pid：`appExit` 关的是 Host，不是桌面应用
+
+这一条是**实测**出来的，也是「重启之后界面一直显示重连中、只能手动退出再打开」的原因：
+
+- `ctx.appExit(0)` 是 **Host 子进程自己的关停**——启动器把它接成
+  `exit: code => void shutdown.shutdown(code)`（`apps/cli/src/profile-boot.ts`），**桌面应用不会跟着退**。
+- 于是 Host 走了、后端没了，而 Electron 主进程还活着：界面停在「重连中」，谁也拉不起来。
+- 托盘菜单那条路为什么行：它在**壳自己进程内**，是 `app.relaunch() + app.exit()`，Host 侧够不着。
+
+所以计划里记的是两个 pid，看门狗分三段干活：
+
+```
+1. 等 hostPid 消失        ← 这才是 appExit 真的会做到的事（超时 → 放弃，退 3）
+2. 请 shellPid 关主窗口     ← CloseMainWindow()，等 shellGraceSeconds（默认 8s）
+   还没走就 Stop-Process -Force  ← 留着它就会和新实例抢同一个 profile
+3. 确认没有同名进程残留 → Start-Process 拉起 exe
+```
+
+任何一段超时它都**放弃并且不启动第二个实例**，并且在 `restart-watch.log` 里写清放弃在哪一段。
+脚本还能在没拿到 `-HostPid` 时自己找：壳的子进程里命令行带 `--expose-internals` 的那个就是 Host
+（实测从壳那一层看是唯一的），所以「脚本已经是新的、加载中的 Node 还是旧的」那一格也能正确工作。
 
 重启后的恢复腿挂在 bundle 加载期：读那份计划，`sessionController` 还没装配就每 3 秒重试（最多
 `resumeWaitMs`），然后对每条会话 `resolveAgent + followup` 投一条「继续」（默认正文
@@ -186,8 +204,9 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 | `guard.requireConfirmForRestart` | `true` | `dsh_host {action:"restart"}` 是否必须带 `confirm:true`（`dryRun:true` 不需要） |
 | `restart.enabled` | `true` | 启动时是否检查并执行恢复计划 |
 | `restart.delaySeconds` | `6` | 请求退出前的延迟：本次工具结果要先送达 |
-| `restart.watcherTimeoutSeconds` | `180` | 看门狗等主进程退出的上限；到点放弃，不启动第二个实例 |
-| `restart.settleMs` | `1500` | 主进程退出后再等多久才拉起（让会话日志写完） |
+| `restart.watcherTimeoutSeconds` | `180` | 看门狗等 **Host 子进程**关停的上限；到点放弃，不启动第二个实例 |
+| `restart.settleMs` | `1500` | Host 走后再等多久才动桌面壳（让会话日志写完） |
+| `restart.shellGraceSeconds` | `8` | 请桌面壳关主窗口后等多久；还不走就强杀——否则它会和新实例抢 profile |
 | `restart.maxResume` | `20` | 一次最多自动继续多少条会话 |
 | `restart.planTtlSeconds` | `900` | 计划的有效期；过期不再恢复 |
 | `restart.resumeText` | `继续上次未完成的工作。` | 重启后投给每条会话的正文 |
@@ -199,7 +218,7 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 ## 验证
 
 ```powershell
-node --test "tests/*.test.mjs"   # 64 个用例：配置归一化、路径编码、zstd 帧解码、工具契约、宿主适配、重启计划
+node --test "tests/*.test.mjs"   # 80 个用例：配置归一化、路径编码、zstd 帧解码、工具契约、动作超时、宿主适配、重启计划与看门狗契约
 node selftest.mjs                # 不开 DSH 也能跑：磁盘回退 + 探测 + UI 回退找窗口 + 重启计划位置
 ```
 
@@ -208,10 +227,16 @@ node selftest.mjs                # 不开 DSH 也能跑：磁盘回退 + 探测 
 
 ## 已知边界
 
-- **重启是「进程外」完成的，而且只认桌面壳**。DSH 没有公开的 restart API：桌面壳自己的「重启应用与
-  Host」是 Electron 侧的 `app.relaunch() + exit()`，Host 只拿得到 `ctx.appExit`——它能请求退出，但退出
-  之后没有任何代码还活着去把应用拉起来。所以本插件写计划 + 起看门狗 + 延迟退出三步走。**跑在 headless
-  的 `dsh` CLI 里时它会明确拒绝**（那时看不到桌面壳，退出就回不来），而不是赌一把。
+- **重启是「进程外」完成的，而且只认桌面壳**。DSH 没有公开的 restart API。`ctx.appExit` 关的是 **Host
+  子进程**（启动器把它接成 `shutdown.shutdown(code)`），桌面应用不会跟着退——这是实测出来的，也是
+  「重启后界面停在重连中」的原因。壳自己的「重启应用与 Host」是 Electron 侧的
+  `app.relaunch() + exit()`，只在它自己进程内可达。所以本插件：写计划（含 `shellPid`/`hostPid`）+
+  起看门狗 + 延迟关停；看门狗等 Host 走、再请壳关窗（宽限期内不走就强杀），最后拉起 exe。
+  **跑在 headless 的 `dsh` CLI 里时它会明确拒绝**（那时看不到桌面壳，退出就回不来），而不是赌一把。
+- **强杀桌面壳是最后手段，而且只用在「后端已经关了」的壳上**：Host 已经优雅关停（会话日志在那之前
+  已 flush），剩下来的壳只是一个没有后端的窗口。不杀它才是错的——它会和新实例抢同一个 profile。
+  宽限期（`restart.shellGraceSeconds`）就是给「自己退得掉」留的余地；`restart-watch.log` 里写清了
+  这一次走的是哪一条。
 - **看门狗的存活方式是量出来的，不是假设的**。WMI 起的进程父进程是 `WmiPrvSE.exe`（实测），所以它不在
   DSH 的进程树里；`detached` 只是退路。仍有残余风险：如果壳在退出时把**整个用户会话**里的进程都收走
   （目前没有观察到），重启就不会自动发生——那种情况下的兜底是「计划仍在盘上」，你手动打开 DSH 后恢复腿

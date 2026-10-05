@@ -520,7 +520,7 @@ test('restartHost：计划先落盘、看门狗先起来、退出是延迟的，
   const timers = []
   const exits = []
   const host = adapter(ctx, normalizeConfig(undefined), {
-    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', commandLine: '"C:\\app\\DeepSeek Harness.exe"', evidence: '父进程 11368 是 DeepSeek Harness' }),
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', commandLine: '"C:\\app\\DeepSeek Harness.exe"', evidence: '父进程 11368 是 DeepSeek Harness' }),
     startWatcher: () => ({ pid: 4242, method: 'wmi', logPath: 'C:\\state\\restart-watch.log', script: 'restart-watch.ps1', shell: 'powershell.exe' }),
     watcherAlive: async () => true,
     writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
@@ -552,6 +552,12 @@ test('restartHost：计划先落盘、看门狗先起来、退出是延迟的，
   assert.ok(written.some((plan) => plan.watcher?.pid === 4242))
   assert.ok(written.some((plan) => plan.exit?.delaySeconds === 6))
 
+  // 两个 pid 都要进计划：`appExit` 关的是 Host（本进程），壳要靠看门狗收尾。只记壳 pid 的版本
+  // 让看门狗等错了对象——Host 走了、壳还在，界面停在「重连中」，最后只能放弃。
+  assert.deepEqual(armed.shell.shellPid, 11368)
+  assert.deepEqual(armed.shell.hostPid, 4242)
+  assert.equal(armed.shell.mainPid, undefined, '旧字段名不该再出现')
+
   // 退出必须是延迟的：立刻退，调用方就永远看不到这个结果。
   assert.deepEqual(exits, [])
   assert.equal(timers.length, 1)
@@ -561,6 +567,7 @@ test('restartHost：计划先落盘、看门狗先起来、退出是延迟的，
   for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
   assert.equal(agents.get('session-a').cancelCalls.length, 1, '退出前一刻才收调用者')
   assert.deepEqual(exits, [0])
+  assert.ok(written.at(-1).exit.requestedAt !== undefined, '「请求已发出」要留痕，否则事后分不清没走到和没人响应')
 })
 
 test('restartHost 先落 arming 痕迹、再快照，而且同一次调用只扫一遍会话', async () => {
@@ -578,7 +585,7 @@ test('restartHost 先落 arming 痕迹、再快照，而且同一次调用只扫
     agents: { get: () => null },
   })
   const host = adapter(ctx, normalizeConfig(undefined), {
-    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     startWatcher: () => ({ pid: 1, method: 'wmi', logPath: 'l', script: 's', shell: 'powershell.exe' }),
     watcherAlive: async () => true,
     writePlan: (plan) => { order.push(`plan:${plan.state}`); return plan },
@@ -593,11 +600,30 @@ test('restartHost 先落 arming 痕迹、再快照，而且同一次调用只扫
   assert.equal(order.filter((entry) => entry === 'plan:arming').length, 1)
 })
 
+test('restartHost 把两个 pid 和壳的宽限期交给看门狗（等的是 Host，不是桌面壳）', async () => {
+  const { ctx } = twoRunningSessions()
+  const specs = []
+  const host = adapter(ctx, normalizeConfig({ restart: { shellGraceSeconds: 12 } }), {
+    probeShell: async () => ({ ok: true, shellPid: 5320, hostPid: 18620, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    startWatcher: (spec) => { specs.push(spec); return { pid: 1, method: 'wmi', logPath: 'l', script: 's', shell: 'powershell.exe' } },
+    watcherAlive: async () => true,
+    writePlan: (plan) => plan,
+    later: () => ({ unref() {} }),
+    requestExit: () => {},
+  })
+
+  await host.restartHost({})
+  assert.equal(specs.length, 1)
+  assert.equal(specs[0].shellPid, 5320)
+  assert.equal(specs[0].hostPid, 18620)
+  assert.equal(specs[0].shellGraceSeconds, 12)
+})
+
 test('restartHost 的 dryRun 保持纯净：不写任何文件，包括那份 arming 痕迹', async () => {
   const { ctx, agents } = twoRunningSessions()
   const written = []
   const host = adapter(ctx, normalizeConfig(undefined), {
-    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     writePlan: (plan) => { written.push(plan); return plan },
     startWatcher: () => { throw new Error('dryRun 不该起看门狗') },
     requestExit: () => { throw new Error('dryRun 不该请求退出') },
@@ -617,7 +643,7 @@ test('restartHost 在看门狗起不来时绝不请求退出', async () => {
   const written = []
   const exits = []
   const host = adapter(ctx, normalizeConfig(undefined), {
-    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     startWatcher: () => { throw new Error('powershell 起不来') },
     writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
     later: () => { throw new Error('不该排任何定时器') },
@@ -637,7 +663,7 @@ test('restartHost 在退出前发现看门狗已经死了，就取消退出', as
   const exits = []
   const timers = []
   const host = adapter(ctx, normalizeConfig(undefined), {
-    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     startWatcher: () => ({ pid: 4242, method: 'wmi', logPath: 'l', script: 's', shell: 'powershell.exe' }),
     watcherAlive: async () => false,
     writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
@@ -659,7 +685,7 @@ test('restartHost 在问不出看门狗死活时（null）照常退出', async (
   const exits = []
   const timers = []
   const host = adapter(ctx, normalizeConfig(undefined), {
-    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    probeShell: async () => ({ ok: true, shellPid: 11368, hostPid: 4242, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
     startWatcher: () => ({ pid: 4242, method: 'detached', logPath: 'l', script: 's', shell: 'powershell.exe' }),
     watcherAlive: async () => null,
     writePlan: (plan) => plan,
@@ -676,7 +702,7 @@ test('restartHost 在问不出看门狗死活时（null）照常退出', async (
 test('restartHost 在找不到桌面壳时什么都不做', async () => {
   const { ctx, agents } = twoRunningSessions()
   const host = adapter(ctx, normalizeConfig(undefined), {
-    probeShell: async () => ({ ok: false, mainPid: 1, exe: null, reason: '跑在 headless 的 dsh CLI 里' }),
+    probeShell: async () => ({ ok: false, shellPid: 1, hostPid: 4242, exe: null, reason: '跑在 headless 的 dsh CLI 里' }),
     startWatcher: () => { throw new Error('不该起看门狗') },
   })
 

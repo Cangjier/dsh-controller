@@ -1,17 +1,21 @@
 /**
  * 重启编排里「进程外」的那一半：计划落盘、桌面壳探测、分离看门狗。
  *
- * 为什么这件事必须有一半在进程外：DSH 没有「重启」API。桌面壳自己是 `app.relaunch() + exit()`
- * （托盘菜单「重启应用与 Host」），Host 侧只拿得到 `ctx.appExit`——它能请求退出，但退出之后
- * 没有任何代码还活着去把应用拉起来。所以顺序是死的：
+ * 为什么这件事必须有一半在进程外：DSH 没有「重启」API。Host 侧只拿得到 `ctx.appExit`，而它
+ * **关的是 Host 子进程自己**（实测启动器源码 `apps/cli/src/profile-boot.ts`：
+ * `exit: code => void shutdown.shutdown(code)`），不是桌面应用——桌面壳的
+ * `app.relaunch() + exit()` 只在它自己进程内可达（托盘菜单「重启应用与 Host」）。所以顺序是死的：
  *
- *   1. 先**证明**退出去还拉得起来（`probeDesktopShell()` 找到真正的主进程与 exe）；
+ *   1. 先**证明**退出去还拉得起来（`probeDesktopShell()` 找到真正的主进程与 exe，并且报出
+ *      「本进程」这个 Host 子进程的 pid——要等的是它，不是主进程）；
  *   2. 把「重启前谁在跑」写成计划落盘（退出之后就没人写了）；
  *   3. 用 `detached` 起一个看门狗进程（它**不属于** DSH 的进程树，DSH 死了它还活着）；
  *   4. 最后才请求退出，而且是延迟的——工具结果要先送达调用方。
  *
- * 看门狗只做一件事：等主进程 PID 消失，然后启动 exe。超过时限主进程还没退，它就放弃并且
- * **不启动第二个实例**——宁可「重启没发生」，也不要两个 DSH 抢同一个 profile。
+ * 看门狗分三段，每一段都对应一个实测事实：等 **Host** 消失（那是 `appExit` 真的做到了的事）→
+ * 壳还在（后端没了、界面停在「重连中」），先请它关窗、超时就强杀 → 确认没有同名进程残留，才
+ * 启动 exe。任何一段超时它都放弃并且**不启动第二个实例**——宁可「重启没发生」，也不要两个 DSH
+ * 抢同一个 profile。
  *
  * @module dsh-controller/host/restart
  */
@@ -145,17 +149,29 @@ function shellProbeScript(ppid) {
 }
 
 /**
- * 找到「退出之后要重新拉起的那个进程」，并证明它真的是桌面壳。
+ * 找到桌面壳，并把「重启这件事涉及的两个进程」一起报出来。
+ *
+ * **先搞清楚这两个 pid 各是谁**（这一步曾经搞反过，代价是一次「重连中」）：
+ *   - `shellPid` = `process.ppid` = Electron 主进程，也就是**桌面应用本身**；
+ *   - `hostPid` = `process.pid` = 本插件所在的 **Host 子进程**（命令行带 `--expose-internals`）。
+ *
+ * `ctx.appExit(0)` 关的是**后者**：DSH 的启动器把它接成 Host 自己的关停（实测
+ * `apps/cli/src/profile-boot.ts` 里 `exit: code => void shutdown.shutdown(code)`），
+ * 桌面壳根本不会跟着退。所以「等主进程消失再拉起」等错了对象：Host 退出、后端消失、界面停在
+ * 「重连中」，而壳还在，看门狗等满超时只能放弃。现在两个 pid 都记进计划，看门狗等 Host，
+ * 再处理留下来的壳。
  *
  * 判定不靠猜：父进程的 exe 必须和本进程的 `process.execPath` 是同一个文件，而且它的命令行里
  * 不能带 `--expose-internals`（那是 Host 子进程的标志，不是壳主进程的）。跑在 headless 的
  * `dsh` CLI 里时父进程是终端，这两条都过不了——那时重启就该被拒绝，而不是退出去回不来。
  * @param {object} [deps] - `{ exec }`，测试用来避免真的去问 Windows。
- * @returns {Promise<object>} `{ ok, mainPid, exe, commandLine, reason, evidence }`。
+ * @returns {Promise<object>} `{ ok, shellPid, hostPid, exe, commandLine, reason, evidence }`。
  */
 export async function probeDesktopShell(deps = {}) {
+  // 「关掉谁」的答案不随平台变：hostPid 永远是本进程自己。
+  const hostPid = process.pid
   if (process.platform !== 'win32') {
-    return { ok: false, mainPid: null, exe: null, reason: `桌面壳只存在于 Windows（当前平台 ${process.platform}）` }
+    return { ok: false, shellPid: null, hostPid, exe: null, reason: `桌面壳只存在于 Windows（当前平台 ${process.platform}）` }
   }
   const exec = typeof deps.exec === 'function' ? deps.exec : run
   const ppid = process.ppid
@@ -170,29 +186,29 @@ export async function probeDesktopShell(deps = {}) {
       if (error?.code === 'ENOENT') { lastError = error; continue }
       parsed = parseJsonLine(`${(error?.stdout ?? Buffer.alloc(0)).toString('utf8')}\n${(error?.stderr ?? Buffer.alloc(0)).toString('utf8')}`)
       if (parsed !== null) break
-      return { ok: false, mainPid: ppid, exe: null, reason: `探测父进程失败：${error?.message ?? String(error)}` }
+      return { ok: false, shellPid: ppid, hostPid, exe: null, reason: `探测父进程失败：${error?.message ?? String(error)}` }
     }
   }
   if (parsed === null) {
-    return { ok: false, mainPid: ppid, exe: null, reason: `找不到可用的 PowerShell（试过 ${POWERSHELL_CANDIDATES.join(', ')}）：${lastError?.message ?? ''}` }
+    return { ok: false, shellPid: ppid, hostPid, exe: null, reason: `找不到可用的 PowerShell（试过 ${POWERSHELL_CANDIDATES.join(', ')}）：${lastError?.message ?? ''}` }
   }
   if (parsed.ok !== true) {
-    return { ok: false, mainPid: ppid, exe: null, reason: `父进程 ${ppid} 不在了：${parsed.reason ?? '未知'}` }
+    return { ok: false, shellPid: ppid, hostPid, exe: null, reason: `父进程 ${ppid} 不在了：${parsed.reason ?? '未知'}` }
   }
 
   const exe = typeof parsed.exe === 'string' && parsed.exe !== '' ? parsed.exe : null
   const commandLine = typeof parsed.commandLine === 'string' ? parsed.commandLine : null
-  const evidence = `父进程 ${ppid} 是 ${parsed.name ?? '?'}：${exe ?? '(拿不到 exe 路径)'}`
+  const evidence = `父进程 ${ppid} 是 ${parsed.name ?? '?'}：${exe ?? '(拿不到 exe 路径)'}（本进程 pid ${hostPid} 是它的 Host 子进程）`
   if (exe === null) {
-    return { ok: false, mainPid: ppid, exe: null, commandLine, evidence, reason: '拿不到父进程的 exe 路径，重启后不知道要拉起什么' }
+    return { ok: false, shellPid: ppid, hostPid, exe: null, commandLine, evidence, reason: '拿不到父进程的 exe 路径，重启后不知道要拉起什么' }
   }
   if (basename(exe).toLowerCase() !== basename(process.execPath).toLowerCase()) {
-    return { ok: false, mainPid: ppid, exe, commandLine, evidence, reason: `父进程的 exe（${basename(exe)}）不是本进程所在的桌面壳（${basename(process.execPath)}）——大概率跑在 headless 的 dsh CLI 里` }
+    return { ok: false, shellPid: ppid, hostPid, exe, commandLine, evidence, reason: `父进程的 exe（${basename(exe)}）不是本进程所在的桌面壳（${basename(process.execPath)}）——大概率跑在 headless 的 dsh CLI 里` }
   }
   if (commandLine !== null && commandLine.includes('--expose-internals')) {
-    return { ok: false, mainPid: ppid, exe, commandLine, evidence, reason: '父进程是另一个 Host 子进程，不是桌面壳主进程' }
+    return { ok: false, shellPid: ppid, hostPid, exe, commandLine, evidence, reason: '父进程是另一个 Host 子进程，不是桌面壳主进程' }
   }
-  return { ok: true, mainPid: ppid, exe, commandLine, evidence, reason: null }
+  return { ok: true, shellPid: ppid, hostPid, exe, commandLine, evidence, reason: null }
 }
 
 /** 把命令行参数按 Windows 规则加引号；只在真的需要时加。 */
@@ -228,7 +244,7 @@ function wmiLaunchScript(base64CommandLine) {
  *   2. **detached spawn**：更简单，但只在壳没有那种 Job Object 时才够——所以它是退路，不是首选。
  *
  * 两条都不行就抛错：调用方会因此**不请求退出**。宁可重启没发生，也不要退出去回不来。
- * @param {object} spec - `{ mainPid, exe, timeoutSeconds, settleMs }`。
+ * @param {object} spec - `{ shellPid, hostPid, exe, timeoutSeconds, settleMs, shellGraceSeconds }`。
  * @param {object} [deps] - `{ exec, spawn, launchViaWmi }`，测试用。
  * @returns {Promise<{ pid: number|null, method: string, logPath: string, script: string, shell: string, attempts: object[] }>} 看门狗事实。
  * @throws {Error} 脚本不存在，或两条路都起不来时。
@@ -240,11 +256,17 @@ export async function spawnWatcher(spec, deps = {}) {
   const cliArgs = [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
     '-File', WATCHER_SCRIPT,
-    '-MainPid', String(spec.mainPid),
+    // `-MainPid` 是**旧版 Node 代码**用的名字（它当时传的是桌面壳 pid）。新代码两个 pid 都给，
+    // 脚本优先用 `-ShellPid`/`-HostPid`，并把 `-MainPid` 当壳 pid 的别名——这样「脚本已经是新的、
+    // 加载中的 Node 还是旧的」那一格也能正确工作（脚本是 spawn 时从磁盘读的）。
+    '-MainPid', String(spec.shellPid ?? spec.mainPid ?? 0),
+    '-ShellPid', String(spec.shellPid ?? spec.mainPid ?? 0),
+    '-HostPid', String(spec.hostPid ?? 0),
     '-Exe', String(spec.exe),
     '-LogPath', logPath,
     '-TimeoutSeconds', String(Math.max(1, Math.round(spec.timeoutSeconds ?? 180))),
     '-SettleMs', String(Math.max(0, Math.round(spec.settleMs ?? 1500))),
+    '-ShellGraceSeconds', String(Math.max(0, Math.round(spec.shellGraceSeconds ?? 8))),
   ]
   const exec = typeof deps.exec === 'function' ? deps.exec : run
   const start = typeof deps.spawn === 'function' ? deps.spawn : spawn
