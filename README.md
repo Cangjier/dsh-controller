@@ -133,6 +133,12 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 所以数据面是安全的；丢的是应用的收尾动作（可能在极少数情况下留下孤儿子进程）。换来的是
 **一个确定会发生的重启**，而不是一个「有时不退、退了也说不清」的重启。
 
+**实测记录（2026-10-05 16:27，本机）**：一条 armed 计划 + `relaunch-watch.ps1 -KillAfterSeconds 0`，
+日志逐行是 `relauncher start` → `6 process(es) ... stopping them` → 六个 `stopped pid`（含 Host 与桌面壳）
+→ `no DeepSeek Harness process left` → `relaunched: pid 8768`。从收树到新进程起来 **2.7 秒**，
+新 Host 8 秒后由恢复腿把会话接回来（`outcomes: ok/flushed`、`resumedAt` 有值）。
+`ctx.appExit`、`WM_CLOSE`、托盘三条路的实测结论都在上面——所以这条「收树 + 拉起」是唯一被证明能用的机制。
+
 重启后的恢复腿挂在 bundle 加载期：读那份计划，`sessionController` 还没装配就每 3 秒重试（最多
 `resumeWaitMs`），然后对每条会话 `resolveAgent + followup` 投一条「继续」（默认正文
 `继续上次未完成的工作。`）。三条自我约束：
