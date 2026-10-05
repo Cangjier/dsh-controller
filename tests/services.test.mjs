@@ -539,10 +539,16 @@ test('restartHost：计划先落盘、看门狗先起来、退出是延迟的，
   assert.equal(agents.get('session-b').cancelCalls.length, 1)
   assert.equal(agents.get('session-a').cancelCalls.length, 0)
 
-  // 计划是先落盘的那一份；带 watcher / exit 的是后续几次更新。
-  assert.equal(written[0].state, 'armed')
-  assert.equal(written[0].sessions.length, 2)
+  // 第一次写盘发生在快照**之前**：那是一份 `arming` 痕迹，没有名单、没有看门狗、没有退出。
+  assert.equal(written[0].state, 'arming')
+  assert.deepEqual(written[0].sessions, [])
+  assert.equal(written[0].stop.requested, 0)
   assert.equal(written[0].watcher, undefined)
+  assert.equal(written[0].exit, undefined)
+  // 快照之后才成型为 `armed`：名单、停止结果、看门狗、退出时刻逐次补上。
+  const armed = written.find((plan) => plan.state === 'armed')
+  assert.equal(armed.sessions.length, 2)
+  assert.equal(armed.stop.requested, 2)
   assert.ok(written.some((plan) => plan.watcher?.pid === 4242))
   assert.ok(written.some((plan) => plan.exit?.delaySeconds === 6))
 
@@ -555,6 +561,55 @@ test('restartHost：计划先落盘、看门狗先起来、退出是延迟的，
   for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
   assert.equal(agents.get('session-a').cancelCalls.length, 1, '退出前一刻才收调用者')
   assert.deepEqual(exits, [0])
+})
+
+test('restartHost 先落 arming 痕迹、再快照，而且同一次调用只扫一遍会话', async () => {
+  const order = []
+  let listCalls = 0
+  const ctx = contextWith({
+    appExit: () => {},
+    sessionController: {
+      list: () => {
+        listCalls += 1
+        order.push('snapshot')
+        return [{ sessionId: 'session-a', running: true, agentAvailable: true, blank: false, cwd: 'C:\\a', updatedAt: 2 }]
+      },
+    },
+    agents: { get: () => null },
+  })
+  const host = adapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    startWatcher: () => ({ pid: 1, method: 'wmi', logPath: 'l', script: 's', shell: 'powershell.exe' }),
+    watcherAlive: async () => true,
+    writePlan: (plan) => { order.push(`plan:${plan.state}`); return plan },
+    later: () => ({ unref() {} }),
+    requestExit: () => {},
+  })
+
+  await host.restartHost({})
+  assert.equal(order[0], 'plan:arming', '痕迹必须落在最重的那一步之前——卡在快照时它是唯一的证据')
+  assert.ok(order.indexOf('plan:arming') < order.indexOf('snapshot'))
+  assert.equal(listCalls, 1, 'pauseAll 复用同一份快照，不再扫第二遍（那一步曾经是分钟级的）')
+  assert.equal(order.filter((entry) => entry === 'plan:arming').length, 1)
+})
+
+test('restartHost 的 dryRun 保持纯净：不写任何文件，包括那份 arming 痕迹', async () => {
+  const { ctx, agents } = twoRunningSessions()
+  const written = []
+  const host = adapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    writePlan: (plan) => { written.push(plan); return plan },
+    startWatcher: () => { throw new Error('dryRun 不该起看门狗') },
+    requestExit: () => { throw new Error('dryRun 不该请求退出') },
+  })
+
+  const result = await host.restartHost({ dryRun: true })
+  assert.equal(result.dryRun, true)
+  assert.deepEqual(written, [], '预演不落痕迹——痕迹只在真的要重启时才有意义')
+  assert.equal(result.wouldStop.length, 2)
+  assert.equal(result.wouldResume.length, 2)
+  assert.equal(agents.get('session-a').cancelCalls.length, 0)
+  assert.equal(agents.get('session-b').cancelCalls.length, 0)
 })
 
 test('restartHost 在看门狗起不来时绝不请求退出', async () => {
@@ -626,24 +681,6 @@ test('restartHost 在找不到桌面壳时什么都不做', async () => {
   })
 
   await assert.rejects(() => host.restartHost({}), /headless 的 dsh CLI/)
-  assert.equal(agents.get('session-a').cancelCalls.length, 0)
-  assert.equal(agents.get('session-b').cancelCalls.length, 0)
-})
-
-test('restartHost 的 dryRun 只快照，不停不写不退', async () => {
-  const { ctx, agents } = twoRunningSessions()
-  const written = []
-  const host = adapter(ctx, normalizeConfig(undefined), {
-    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
-    writePlan: (plan) => { written.push(plan); return plan },
-    startWatcher: () => { throw new Error('dryRun 不该起看门狗') },
-  })
-
-  const result = await host.restartHost({ dryRun: true })
-  assert.equal(result.dryRun, true)
-  assert.equal(result.wouldStop.length, 2)
-  assert.equal(result.wouldResume.length, 2)
-  assert.deepEqual(written, [])
   assert.equal(agents.get('session-a').cancelCalls.length, 0)
   assert.equal(agents.get('session-b').cancelCalls.length, 0)
 })
@@ -730,6 +767,60 @@ test('resumeAfterRestart 在服务还没装配好时给出可重试的信号', a
   const result = await host.resumeAfterRestart()
   assert.equal(result.state, 'services-not-ready')
   assert.equal(result.retryable, true)
+})
+
+test('resumeAfterRestart 不会拿「停在快照阶段」的 arming 计划去投消息', async () => {
+  let deliveries = 0
+  const host = adapter(contextWith({
+    sessionController: { resolveAgent: async () => { deliveries += 1; return { agent: fakeAgent() } } },
+  }), normalizeConfig(undefined), {
+    readPlan: () => ({
+      plan: { version: 1, state: 'arming', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, resume: { text: 'x' }, sessions: [], outcomes: [] },
+      path: 'p',
+      error: null,
+    }),
+    writePlan: (plan) => plan,
+    now: () => 1000,
+  })
+
+  const result = await host.resumeAfterRestart()
+  assert.equal(result.state, 'arming')
+  assert.equal(deliveries, 0, '没有请求过退出，就没有证据表明会话被中断过——投递就是凭空的打扰')
+  assert.match(result.reason, /快照阶段/)
+})
+
+test('resumeAfterRestart 把过期的 arming 计划收成 expired，而不是永远留着中间态', async () => {
+  const written = []
+  const host = adapter(contextWith({}), normalizeConfig({ restart: { planTtlSeconds: 10 } }), {
+    readPlan: () => ({
+      plan: { version: 1, state: 'arming', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, resume: { text: 'x' }, sessions: [], outcomes: [] },
+      path: 'p',
+      error: null,
+    }),
+    writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
+    now: () => 60_000,
+  })
+
+  const result = await host.resumeAfterRestart()
+  assert.equal(result.state, 'expired')
+  assert.match(result.failure, /快照阶段/)
+  assert.equal(written.at(-1).state, 'expired')
+})
+
+test('restartStatus 把 arming 计划直说成「按了重启但停在快照」', async () => {
+  const host = adapter(contextWith({}), normalizeConfig(undefined), {
+    readPlan: () => ({
+      plan: { version: 1, state: 'arming', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, shell: {}, stop: {}, sessions: [], outcomes: [] },
+      path: 'p',
+      error: null,
+    }),
+    now: () => 5000,
+  })
+
+  const result = await host.restartStatus()
+  assert.equal(result.plan.state, 'arming')
+  assert.match(result.note, /停在快照阶段/)
+  assert.equal(result.belongsToCurrentBoot, false)
 })
 
 test('restartStatus 在没有计划时说清楚没有，而不是编一个', async () => {

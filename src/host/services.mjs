@@ -968,11 +968,14 @@ export function adapter(ctx, config, deps = {}) {
      * 为什么排除调用者：`pause-all` 十有八九是某个 agent 在它自己那一轮里调的，而
      * `agent.cancel()` 会把这一轮一起中止，工具结果就再也送不回去了。所以调用者的那一轮
      * 留在 `deferred` 里，由调用方决定（`restartHost` 会在请求退出的那一刻收掉它）。
-     * @param {object} args - `{ keepInbox, callerSessionId, limit }`。
+     * @param {object} args - `{ keepInbox, callerSessionId, snapshot }`。
      * @returns {Promise<object>} `{ requested, cancelled, failed, deferred, warnings }`。
      */
     async pauseAll(args = {}) {
-      const snapshot = await this.listRunningSessions()
+      // `snapshot` 让调用方复用已经取过的那一份。`restartHost` 就靠它避免在同一次调用里扫两遍
+      // 「谁在跑」——那一步曾经是分钟级的（478 条会话逐条重折日志，实测 255.7–320.7s），
+      // 扫两遍就是把这个代价翻倍，也把「卡在半路」的机会翻倍。
+      const snapshot = Array.isArray(args.snapshot?.rows) ? args.snapshot : await this.listRunningSessions()
       const callerSessionId = typeof args.callerSessionId === 'string' && args.callerSessionId !== '' ? args.callerSessionId : null
       const cancelled = []
       const failed = []
@@ -1010,6 +1013,8 @@ export function adapter(ctx, config, deps = {}) {
      *
      * 顺序是刻意的，每一步都为了「退出去还回得来」：
      *   - 先证明桌面壳找得到（`probeShell`），否则直接拒绝，绝不先退出去再说；
+     *   - 在干最重的那一步（快照）**之前**先把一份 `arming` 计划落盘，这样「按了重启但没反应」
+     *     在盘上留下痕迹，而不是无从查起（见下面的注释）；
      *   - 再快照「谁在跑」，因为重启后要靠这份名单继续它们；
      *   - 计划**先落盘**：退出之后没有任何代码能补写；
      *   - 看门狗**先起来**：它起不来就不请求退出（宁可重启不发生，也不要退出去回不来）；
@@ -1034,7 +1039,40 @@ export function adapter(ctx, config, deps = {}) {
         throw new Error('宿主没有提供 ctx.appExit —— 没有请求退出的入口（托盘菜单「重启应用与 Host」是产品自己的那条路）')
       }
 
-      // 2. 快照：重启后要继续的就是这份名单。
+      const callerSessionId = typeof args.callerSessionId === 'string' && args.callerSessionId !== '' ? args.callerSessionId : null
+      const delaySeconds = Number.isFinite(args.delaySeconds) && args.delaySeconds > 0 ? args.delaySeconds : config.restart.delaySeconds
+      const resumeText = typeof args.text === 'string' && args.text.trim() !== '' ? args.text : config.restart.resumeText
+
+      const plan = {
+        version: PLAN_VERSION,
+        id: `restart-${randomUUID()}`,
+        createdAt: new Date(nowMs).toISOString(),
+        createdAtMs: nowMs,
+        state: dryRun ? 'dry-run' : 'arming',
+        reason: typeof args.reason === 'string' && args.reason !== '' ? args.reason : 'dsh_host {action:"restart"}',
+        writer: hostIdentity(),
+        shell: { mainPid: shell.mainPid, exe: shell.exe, commandLine: shell.commandLine ?? null, evidence: shell.evidence ?? null },
+        stop: { keepInbox, requested: 0, cancelled: [], failed: [], deferred: [] },
+        resume: { text: resumeText, max: config.restart.maxResume },
+        sessions: [],
+        outcomes: [],
+        resumedAt: null,
+        resumedBy: null,
+      }
+
+      // 2. 先落痕迹，再干最重的那一步。
+      //
+      // 快照要列全部会话，而它曾经是分钟级的：一次调用里逐条重折 478 份日志（实测 255.7s /
+      // 293.9s / 320.7s）。那次 `restart` 就停在第二步——没有错误、没有结果，盘上连状态目录
+      // 都没有，事后只能从会话日志里把它挖出来。所以现在先写一份 `arming`：只要
+      // `dsh_host {action:"status"}` 看到它，答案就是「有人按过重启、卡在快照」。
+      //
+      // `arming` **不是可恢复状态**：没有证据表明重启真的发生过，所以恢复腿不会拿它去投消息
+      // （见 `resumeAfterRestart`）；超过 `planTtlSeconds` 它自己会变成 `expired`。
+      // `dryRun` 保持纯净：它不写任何文件。
+      if (!dryRun) savePlan(plan)
+
+      // 3. 快照：重启后要继续的就是这份名单。
       const snapshot = await this.listRunningSessions()
       const byId = new Map(snapshot.rows.map((row) => [row.sessionId, row]))
       const plannedIds = Array.isArray(args.sessionIds) && args.sessionIds.length > 0
@@ -1046,27 +1084,8 @@ export function adapter(ctx, config, deps = {}) {
         workspace: byId.get(sessionId)?.workspace ?? null,
         wasRunning: byId.has(sessionId),
       }))
-
-      const callerSessionId = typeof args.callerSessionId === 'string' && args.callerSessionId !== '' ? args.callerSessionId : null
-      const delaySeconds = Number.isFinite(args.delaySeconds) && args.delaySeconds > 0 ? args.delaySeconds : config.restart.delaySeconds
-      const resumeText = typeof args.text === 'string' && args.text.trim() !== '' ? args.text : config.restart.resumeText
-
-      const plan = {
-        version: PLAN_VERSION,
-        id: `restart-${randomUUID()}`,
-        createdAt: new Date(nowMs).toISOString(),
-        createdAtMs: nowMs,
-        state: dryRun ? 'dry-run' : 'armed',
-        reason: typeof args.reason === 'string' && args.reason !== '' ? args.reason : 'dsh_host {action:"restart"}',
-        writer: hostIdentity(),
-        shell: { mainPid: shell.mainPid, exe: shell.exe, commandLine: shell.commandLine ?? null, evidence: shell.evidence ?? null },
-        stop: { keepInbox, requested: snapshot.rows.length, cancelled: [], failed: [], deferred: [] },
-        resume: { text: resumeText, max: config.restart.maxResume },
-        sessions,
-        outcomes: [],
-        resumedAt: null,
-        resumedBy: null,
-      }
+      plan.sessions = sessions
+      plan.stop.requested = snapshot.rows.length
 
       if (dryRun) {
         return {
@@ -1082,18 +1101,22 @@ export function adapter(ctx, config, deps = {}) {
         }
       }
 
-      // 3. 立即停止（调用者除外）。
-      const stopped = await this.pauseAll({ keepInbox, callerSessionId })
+      // 4. 计划成型：从这一刻起它是一份「已落盘、等退出」的计划。
+      plan.state = 'armed'
+      savePlan(plan)
+
+      // 5. 立即停止（调用者除外）。用同一份快照，不再扫第二遍。
+      const stopped = await this.pauseAll({ keepInbox, callerSessionId, snapshot })
       plan.stop.cancelled = stopped.cancelled
       plan.stop.failed = stopped.failed
       plan.stop.deferred = stopped.deferred
       plan.stop.source = stopped.source
       warnings.push(...stopped.warnings)
 
-      // 4. 计划落盘：退出之后没人能补写。
+      // 6. 停止结果落盘：退出之后没人能补写。
       savePlan(plan)
 
-      // 5. 看门狗：起不来就绝不请求退出。
+      // 7. 看门狗：起不来就绝不请求退出。
       let watcher
       try {
         watcher = await startWatcher({
@@ -1121,7 +1144,7 @@ export function adapter(ctx, config, deps = {}) {
       }
       savePlan(plan)
 
-      // 6. 延迟退出：先让本次工具结果送达，再收掉调用者那一轮，最后退出。
+      // 8. 延迟退出：先让本次工具结果送达，再收掉调用者那一轮，最后退出。
       const delayMs = Math.max(1, delaySeconds) * 1000
       plan.exit = { delaySeconds, scheduledAt: new Date(clock()).toISOString() }
       savePlan(plan)
@@ -1204,6 +1227,11 @@ export function adapter(ctx, config, deps = {}) {
         belongsToCurrentBoot: sameBoot(plan.writer, current),
         watcherLog,
         currentHost: current,
+        // `arming` 是唯一一种「按了重启但什么都没发生」的形态，值得直说：它意味着协调器停在
+        // 快照那一步，既没落盘会话名单，也没起看门狗，也没请求退出。旧版本的这一步是分钟级的。
+        ...(plan.state === 'arming'
+          ? { note: `上一次重启停在快照阶段（${ageSeconds}s 前落盘，state=arming）：没有会话名单、没有看门狗、也没有请求退出——DSH 一直在跑。这就是「restart 没反应」的样子；重试即可，超过 ${config.restart.planTtlSeconds}s 它自己会变成 expired。` }
+          : {}),
       }
     },
 
@@ -1225,6 +1253,27 @@ export function adapter(ctx, config, deps = {}) {
       }
       if (plan.state === 'done') return { transport: 'disk', state: 'already-done', planPath: path, outcomes: plan.outcomes ?? [], resumedAt: plan.resumedAt ?? null }
       if (plan.state === 'expired') return { transport: 'disk', state: 'expired', planPath: path, failure: plan.failure ?? null }
+
+      // `arming` = 上一次重启停在快照阶段：它**没有**请求过退出，所以没有任何理由认为那些会话
+      // 被中断过。投递恢复消息会是凭空的打扰，所以这里只报事实；过期的 arming 自己收成 expired，
+      // 免得盘上永远留着一份看不懂的中间态。
+      if (plan.state === 'arming') {
+        const armedAgeSeconds = (clock() - (plan.createdAtMs ?? 0)) / 1000
+        if (armedAgeSeconds > config.restart.planTtlSeconds) {
+          plan.state = 'expired'
+          plan.failure = `计划停在快照阶段（没有请求退出），已过期：${Math.round(armedAgeSeconds)}s > ${config.restart.planTtlSeconds}s`
+          savePlan(plan)
+          return { transport: 'disk', state: 'expired', planPath: path, ageSeconds: Math.round(armedAgeSeconds), failure: plan.failure }
+        }
+        return {
+          transport: 'disk',
+          state: 'arming',
+          planPath: path,
+          ageSeconds: Math.round(armedAgeSeconds),
+          reason: '这份计划停在快照阶段：没有落盘会话名单，也没有请求退出，因此没有证据表明会话被中断过——不投递恢复消息。用 dsh_host {action:"restart"} 重试即可。',
+        }
+      }
+
       if (plan.state !== 'armed' && plan.state !== 'claimed') {
         return { transport: 'disk', state: plan.state ?? 'unknown', planPath: path, failure: plan.failure ?? null, reason: `计划状态是 ${plan.state ?? '未知'}，不再恢复` }
       }

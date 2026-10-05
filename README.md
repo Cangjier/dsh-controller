@@ -87,15 +87,25 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 
 1. **先证伪**——父进程的 exe 必须就是本进程所在的那个 exe，且命令行里没有 `--expose-internals`：
    证明「退出去之后有东西可以重新拉起」。跑在 headless 的 `dsh` CLI 里时这一步就失败，于是明确拒绝。
-2. **快照**——重启前 `running: true` 的会话就是重启后要接着跑的名单。
-3. **停止**——立即 `agent.cancel()`，逐条报成功/失败。**发起调用的那条会话除外**：中止它会把正在执行
+2. **先落一份 `arming` 计划**——在干最重的那一步之前先留下痕迹。快照要列全部会话，它曾经在一次调用里
+   逐条重折 478 份日志（实测 255.7s / 293.9s / 320.7s），于是 `restart` 停在第二步：没有错误、没有结果，
+   盘上连状态目录都没有，事后只能从会话日志里把它挖出来。现在只要 `status` 里看到 `arming`，答案就是
+   「有人按过重启、卡在快照」。`arming` **不可恢复**：没有请求过退出，就没有证据表明会话被中断过，
+   恢复腿不会投任何消息；超过 `planTtlSeconds` 它自己变成 `expired`。
+3. **快照**——重启前 `running: true` 的会话就是重启后要接着跑的名单。这份快照随后交给 `pauseAll` 复用，
+   同一次调用不扫第二遍。
+4. **停止**——立即 `agent.cancel()`，逐条报成功/失败。**发起调用的那条会话除外**：中止它会把正在执行
    本次调用的那一轮一起收掉，工具结果就再也送不回去；它排在退出前一刻收。
-4. **计划落盘**——`<DSH home>/controller/restart-plan.json`。退出之后没有任何代码能补写，所以它必须先写。
-5. **看门狗先起来**——它**不属于 DSH 的进程树**：优先用 WMI（`Win32_Process.Create`）起，新进程的父进程
+5. **计划成型落盘**——状态改成 `armed`，写进 `<DSH home>/controller/restart-plan.json`。退出之后没有任何
+   代码能补写，所以它必须先写。
+6. **看门狗先起来**——它**不属于 DSH 的进程树**：优先用 WMI（`Win32_Process.Create`）起，新进程的父进程
    是 `WmiPrvSE.exe`（实测），所以即使桌面壳用 kill-on-close 的 Job Object 收子进程也带不走它；WMI 不可用
    时才退回 `detached` spawn。它起不来就**不请求退出**：宁可重启没发生，也不要退出去回不来。
-6. **延迟退出**——默认 6 秒后才 `ctx.appExit(0)`，为的就是让上面的结果先送达调用方。退出前还会回读一次
+7. **延迟退出**——默认 6 秒后才 `ctx.appExit(0)`，为的就是让上面的结果先送达调用方。退出前还会回读一次
    看门狗是否还活着（`probeWatcherAlive`），它已经不在了就取消退出——退出去且没人拉起来是最坏的结局。
+
+整个动作的时间预算是 **180s**（探壳 20s + 看门狗 30s + 余量）：比它内部每一步的上限都大，否则会在看门狗
+已经起来之后把结果掐掉，而那时退出还在排队——那正是「按了没反应」的另一种形态。
 
 看门狗只做一件事：等主进程 PID 消失 → 再等 `settleMs` 让日志写完 → 确认没有同名进程残留 →
 `Start-Process` 拉起 exe。超时还没退，它**放弃并且不启动第二个实例**（退 3），因为两个 DSH 抢同一个
@@ -110,8 +120,9 @@ profile 比重启失败更糟。
 - **过期不恢复**：超过 `planTtlSeconds`（默认 15 分钟）的计划改成 `expired`，隔夜才打开的应用不会突然满血复活。
 
 `dsh_host {action:"status"}` 读的就是那份计划与看门狗日志（`transport: "disk"`——它们只存在于磁盘上，
-这不是降级，而是唯一存在的地方）。想只看不动，用 `restart {dryRun:true, confirm:true}`：它照样会跑
-「先证伪」那一步，所以「这台机器上到底能不能重启」在没有副作用的情况下就能问出答案。
+这不是降级，而是唯一存在的地方）。想只看不动，用 `restart {dryRun:true}`（**不需要 `confirm`**：它不写盘、
+不停会话、不退出，而它恰恰就是「先说清要停掉哪些会话」的那一步）：它照样会跑「先证伪」与快照那两步，
+所以「这台机器上到底能不能重启」在没有副作用的情况下就能问出答案。
 
 ## 三层通道与降级顺序
 
@@ -164,7 +175,7 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 | `enabled` | `true` | `false` = 一个工具都不注册 |
 | `api.forceUi` | `false` | 明确要求「即使 API 可用也走 UI」，只在排查时用 |
 | `api.defaultWaitMs` | `120000` | `dsh_sessions {action:"wait"}` 的默认上限 |
-| `api.actionTimeoutMs` | `30000` | 会话类动作的超时 |
+| `api.actionTimeoutMs` | `30000` | 一次调用的时间预算：超时以可读错误收口（不等于取消）。慢动作各自声明更大的上限：`wait` = `defaultWaitMs`+10s、`create` = `clickTimeoutMs`+`waitMs`+30s、`install`/`remove` = 900s、`restart` = 180s、`resume` = 120s |
 | `ui.windowTitle` | `null` | 目标窗口标题子串；`null` = 按进程名找 |
 | `ui.processName` | `DeepSeek Harness` | 没有 `windowTitle` 时按进程名找窗口 |
 | `ui.screenshotDir` | `<插件>/tmp/screens` | `look` 的落地目录 |
@@ -172,7 +183,7 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 | `ui.focusSettleMs` | `120` | 前台化后等待多久再确认 |
 | `guard.requireConfirmForCreate` | `false` | 建会话是否必须带 `confirm:true` |
 | `guard.requireConfirmForPlugins` | `true` | 改插件状态是否必须带 `confirm:true` |
-| `guard.requireConfirmForRestart` | `true` | `dsh_host {action:"restart"}` 是否必须带 `confirm:true` |
+| `guard.requireConfirmForRestart` | `true` | `dsh_host {action:"restart"}` 是否必须带 `confirm:true`（`dryRun:true` 不需要） |
 | `restart.enabled` | `true` | 启动时是否检查并执行恢复计划 |
 | `restart.delaySeconds` | `6` | 请求退出前的延迟：本次工具结果要先送达 |
 | `restart.watcherTimeoutSeconds` | `180` | 看门狗等主进程退出的上限；到点放弃，不启动第二个实例 |

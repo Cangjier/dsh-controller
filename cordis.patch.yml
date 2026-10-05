@@ -29,7 +29,10 @@
           forceUi: false
           # `dsh_sessions {action:"wait"}` 的默认等待上限（毫秒）。
           defaultWaitMs: 120000
-          # 动作级超时（毫秒）：创建/投递/中止这类调用不会无限等。
+          # 动作级超时（毫秒）：一次调用超过它就带着一条可读的错误收口，而不是永远挂着
+          # （超时不等于取消，底下那件事可能还在跑）。故意慢的动作各自声明更大的上限：
+          # wait = defaultWaitMs + 10s、create = clickTimeoutMs + waitMs + 30s、
+          # install/remove = 900s、host restart = 180s、host resume = 120s。
           actionTimeoutMs: 30000
 
         create:

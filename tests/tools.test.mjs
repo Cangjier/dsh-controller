@@ -107,7 +107,7 @@ test('send 的参数校验在碰宿主之前完成', async () => {
   await assert.rejects(() => sessions.execute({ action: 'send', sessionId: 's' }, {}), /需要非空的 text/)
 })
 
-test('restart 的确认门槛默认打开，过了门槛才碰宿主', async () => {
+test('restart 的确认门槛默认打开，过了门槛才碰宿主；dryRun 是例外，它不该被门槛挡住', async () => {
   const calls = []
   const stub = {
     pauseAll: async (args) => { calls.push(['pause-all', args]); return { transport: 'api', requested: 0, cancelled: [], failed: [], deferred: [] } },
@@ -117,12 +117,19 @@ test('restart 的确认门槛默认打开，过了门槛才碰宿主', async () 
   }
 
   const strict = createHostTool(stub, normalizeConfig({ guard: { requireConfirmForRestart: true } }))
-  await assert.rejects(() => strict.execute({ action: 'restart', dryRun: true }, {}), /需要 confirm:true/)
+  // 真重启必须过门槛。
+  await assert.rejects(() => strict.execute({ action: 'restart' }, {}), /需要 confirm:true/)
   assert.equal(calls.length, 0, '门槛没过就一步都不该碰宿主')
 
-  await strict.execute({ action: 'restart', confirm: true, dryRun: true }, {})
+  // 预演不写盘、不停会话、不退出——门槛保护的是真重启，所以它不该要求 confirm。
+  const dry = await strict.execute({ action: 'restart', dryRun: true }, {})
+  assert.equal(dry.dryRun, true)
   assert.deepEqual(calls.map(([name]) => name), ['restart'])
   assert.equal(calls[0][1].dryRun, true)
+  assert.equal(calls[0][1].confirm, undefined, 'dryRun 不该顺手把 confirm 塞给宿主')
+
+  await strict.execute({ action: 'restart', confirm: true, dryRun: true }, {})
+  assert.equal(calls.length, 2)
 
   // 调用者身份要一路传下去：restart / pause-all 靠它把「自己那一轮」留到退出前才收。
   const loose = createHostTool(stub, normalizeConfig({ guard: { requireConfirmForRestart: false } }))
@@ -134,6 +141,34 @@ test('restart 的确认门槛默认打开，过了门槛才碰宿主', async () 
   const disabled = createHostTool(stub, normalizeConfig({ restart: { enabled: false }, guard: { requireConfirmForRestart: false } }))
   await assert.rejects(() => disabled.execute({ action: 'restart', confirm: true }, {}), /重启编排被关掉了/)
   await disabled.execute({ action: 'pause-all' }, {})
+})
+
+test('动作超时：挂着不返回的动作会以一条可读的错误收口，而不是永远不返回', async () => {
+  const stuck = {
+    pauseAll: async () => ({ transport: 'api' }),
+    restartHost: async () => ({ transport: 'api' }),
+    // 一个永不 resolve 的宿主调用——这正是「restart 没效果」的形态：没有错误、没有结果。
+    restartStatus: () => new Promise(() => {}),
+    resumeAfterRestart: async () => ({ transport: 'api', state: 'no-plan' }),
+  }
+  const host = createHostTool(stuck, normalizeConfig({ api: { actionTimeoutMs: 30 } }))
+
+  const started = Date.now()
+  await assert.rejects(() => host.execute({ action: 'status' }, {}), /超过 30 ms 还没有结果/)
+  assert.ok(Date.now() - started < 5_000, '超时必须是这个数量级，不是等到底下那件事自己结束')
+})
+
+test('动作超时：故意慢的动作按自己的预算放行，不受 actionTimeoutMs 影响', async () => {
+  const slow = {
+    pauseAll: async () => ({ transport: 'api' }),
+    restartHost: async () => ({ transport: 'api' }),
+    restartStatus: async () => ({ transport: 'disk' }),
+    // 80ms > actionTimeoutMs(20ms)：只要 resume 用的是自己声明的 120s，它就必须正常返回。
+    resumeAfterRestart: () => new Promise((resolve) => setTimeout(() => resolve({ transport: 'api', state: 'done' }), 80)),
+  }
+  const host = createHostTool(slow, normalizeConfig({ api: { actionTimeoutMs: 20 } }))
+  const result = await host.execute({ action: 'resume' }, {})
+  assert.equal(result.state, 'done')
 })
 
 test('dsh_host 的 guide 说清 restart 要 confirm，并且路由写明重新拉起由进程外完成', async () => {

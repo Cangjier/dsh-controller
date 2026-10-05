@@ -36,6 +36,45 @@ export class ControllerError extends Error {
   }
 }
 
+/**
+ * 给一次调用加一个时间预算。
+ *
+ * 为什么需要它：`config.api.actionTimeoutMs` 曾经只是文档里的一个数字（`src/` 里 0 处引用），
+ * 于是一个慢下来的动作表现为**永远不返回**——没有错误、没有结果、盘上也没有痕迹。2026-10-05
+ * 的一次 `dsh_host {action:"restart"}` 就是这样丢掉的：它进到快照那一步，`list` 在一次调用里
+ * 逐条重折 478 份日志（实测 255.7s / 293.9s / 320.7s），调用挂在那里，事后无从查起。
+ *
+ * 两条规矩：
+ *   - **超时不等于取消。** JS 里撤不掉已经在跑的工作量，这个上限只保证「这次调用会以一条可读的
+ *     错误收口」，不保证底下那件事停了。所以预算必须**大于**该动作内部每一步自己的超时之和，
+ *     否则工具会先报超时、底下还在动——那比超时本身更糟。
+ *   - **要长就显式声明。** `spec.timeoutFor(action, args)` 返回正数 = 该动作的预算，返回 `null` =
+ *     不限时。没声明的动作用 `spec.timeoutMs`（各工具从 `config.api.actionTimeoutMs` 取值）。
+ * @param {Promise<unknown>|unknown} work - 已经启动的工作。
+ * @param {number|null|undefined} ms - 预算（毫秒）；null / 非正数 / 非数字 = 不限时。
+ * @param {() => string} onTimeout - 超时时构造错误文案。
+ * @returns {Promise<unknown>} 工作本身的结果。
+ * @throws {ControllerError} 超过预算还没有结果时。
+ */
+export async function withActionTimeout(work, ms, onTimeout) {
+  const promise = work instanceof Promise ? work : Promise.resolve(work)
+  if (!Number.isFinite(ms) || ms <= 0) return await promise
+  let timer = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_resolve, reject) => {
+        // 故意不 unref：这个定时器是这次调用唯一的「会结束」的保证，让它跟着事件循环走。
+        timer = setTimeout(() => reject(new ControllerError(onTimeout())), ms)
+      }),
+    ])
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+    // 超时之后底下那件事仍可能成功或失败：它不该变成一个 unhandled rejection。
+    promise.catch(() => {})
+  }
+}
+
 /** 完整参考在哪读；每个工具描述里重复一次。 */
 function guideHint(name) {
   return `Full detail: dsh_control {action:"guide", tool:"${name}"}.`
@@ -94,12 +133,24 @@ export function describeTool(name, entry, actions) {
  * @param {string[]} spec.actions - 全部合法 `action` 值，按分派顺序。
  * @param {object} spec.extraProperties - 额外的 JSON Schema 属性。
  * @param {Record<string, (args: object, context: object) => Promise<object>>} spec.handlers - 每个动作一个实现。
+ * @param {number|null} [spec.timeoutMs] - 这个工具的默认时间预算；`null` = 不限时。
+ * @param {(action: string, args: object) => number|null} [spec.timeoutFor] - 按动作声明预算，覆盖 `timeoutMs`。
  * @param {() => object} [spec.locate] - 每次调用解析一次宿主服务。
  * @returns {object} 可以交给 `ctx.tools.register` 的原始工具定义。
  */
 export function defineFamilyTool(spec) {
   const actions = [...spec.actions]
   const entry = lookupTool(spec.name)
+
+  /** 这次调用的预算：动作自己声明的优先，其次工具的默认值。 */
+  const budgetFor = (action, args) => {
+    if (typeof spec.timeoutFor === 'function') {
+      const declared = spec.timeoutFor(action, args)
+      if (declared === null) return null
+      if (Number.isFinite(declared) && declared > 0) return declared
+    }
+    return spec.timeoutMs ?? null
+  }
 
   const documented = Object.keys(entry.actions)
   for (const action of actions) {
@@ -151,7 +202,13 @@ export function defineFamilyTool(spec) {
             ? context.agent.session.header.cwd
             : process.cwd()
       const safeContext = { ...context, ...located, cwd }
-      return handler(args ?? {}, safeContext)
+      const budget = budgetFor(args.action, args ?? {})
+      return await withActionTimeout(
+        handler(args ?? {}, safeContext),
+        budget,
+        () => `${spec.name} {action:${JSON.stringify(args?.action)}} 超过 ${budget} ms 还没有结果。超时不代表底下那件事停了：先看 dsh_host {action:"status"}（重启计划）与 dsh_plugins {action:"log"}（插件操作）里有没有半成品，再决定重试；` +
+          '预算默认是 config.api.actionTimeoutMs，慢动作（会话等待 / 新建 / 装插件 / 重启）各自声明了更大的上限。',
+      )
     },
   }
 }

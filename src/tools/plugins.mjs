@@ -34,6 +34,16 @@ export function createPluginsTool(host, config) {
   return defineFamilyTool({
     name: PLUGINS_TOOL_NAME,
     actions: PLUGINS_ACTIONS,
+    /**
+     * 这个工具的时间预算。
+     *
+     * 装/卸要走 pnpm（外部进程，几分钟很正常），这两个动作给足预算；其余动作一句话就该回来，
+     * 用默认值——它们慢下来只会是「服务卡住」，那时一条可读的超时比无限等待有用。
+     */
+    timeoutFor(action) {
+      if (action === 'install' || action === 'remove') return 900_000
+      return config.api.actionTimeoutMs
+    },
     extraProperties: {
       id: { type: 'string', description: 'enable / disable / remove: the plugin row id or the bundle name, as reported by list.' },
       spec: { type: 'string', description: 'install / inspect: an npm name, a git URL, or an absolute local path.' },

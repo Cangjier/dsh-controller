@@ -4,7 +4,7 @@
  * @module dsh-controller/tools/control
  */
 import { TOOLS } from './registry.mjs'
-import { ControllerError } from './shared.mjs'
+import { ControllerError, withActionTimeout } from './shared.mjs'
 
 export const CONTROL_TOOL_NAME = 'dsh_control'
 
@@ -85,45 +85,56 @@ export function createControlTool(host, config, logger) {
     },
     output: { schema: { type: 'object', additionalProperties: true }, render: renderText },
     async execute(args, context) {
-      switch (args.action) {
-        case 'overview':
-          return host.overview()
-        case 'capabilities':
-          return { transport: 'api', ...host.capabilities() }
-        case 'session': {
-          const sessionId = args.sessionId ?? selfSessionId(context)
-          if (sessionId === null) {
-            throw new ControllerError('dsh_control {action:"session"}: 拿不到当前会话 id（调用上下文里没有 agent），请显式给 sessionId')
-          }
-          return host.sessionState(sessionId)
-        }
-        case 'transport': {
-          const capabilities = host.capabilities()
-          const available = new Set(capabilities.api.filter((entry) => entry.available).map((entry) => entry.service))
-          const rows = {}
-          for (const [key, route] of Object.entries(ROUTES)) {
-            rows[key] = {
-              preferred: route.preferred,
-              fallback: route.fallback,
-              reason: route.reason,
-              // 首选通道现在真的可用吗：api 看服务是否在，ui 看平台与脚本，disk 永远可用。
-              usableNow: route.preferred === 'api'
-                ? available.size > 0
-                : route.preferred === 'ui'
-                  ? capabilities.ui.some((channel) => channel.available)
-                  : route.preferred === 'disk'
-                    ? true
-                    : null,
-            }
-          }
-          return { transport: 'api', servicesAvailable: [...available].sort(), routes: rows, uiChannels: capabilities.ui }
-        }
-        case 'guide':
-          return guide(args, logger)
-        default:
-          throw new ControllerError(`dsh_control: unknown action ${JSON.stringify(args.action)}`)
-      }
+      // 这个工具不是 `defineFamilyTool` 造的（它的 schema 形状不同），所以时间预算要自己接上：
+      // `overview` 曾经因为按条重折日志要 33.5s，而超时是它唯一会「结束」的保证。
+      return await withActionTimeout(
+        dispatch(args, context),
+        config.api.actionTimeoutMs,
+        () => `dsh_control {action:${JSON.stringify(args?.action)}} 超过 ${config.api.actionTimeoutMs} ms 还没有结果（config.api.actionTimeoutMs）。超时不代表底下那件事停了，先缩小范围再试。`,
+      )
     },
+  }
+
+  /** 动作分派；由 `execute` 加上时间预算后调用。 */
+  async function dispatch(args, context) {
+    switch (args.action) {
+      case 'overview':
+        return host.overview()
+      case 'capabilities':
+        return { transport: 'api', ...host.capabilities() }
+      case 'session': {
+        const sessionId = args.sessionId ?? selfSessionId(context)
+        if (sessionId === null) {
+          throw new ControllerError('dsh_control {action:"session"}: 拿不到当前会话 id（调用上下文里没有 agent），请显式给 sessionId')
+        }
+        return host.sessionState(sessionId)
+      }
+      case 'transport': {
+        const capabilities = host.capabilities()
+        const available = new Set(capabilities.api.filter((entry) => entry.available).map((entry) => entry.service))
+        const rows = {}
+        for (const [key, route] of Object.entries(ROUTES)) {
+          rows[key] = {
+            preferred: route.preferred,
+            fallback: route.fallback,
+            reason: route.reason,
+            // 首选通道现在真的可用吗：api 看服务是否在，ui 看平台与脚本，disk 永远可用。
+            usableNow: route.preferred === 'api'
+              ? available.size > 0
+              : route.preferred === 'ui'
+                ? capabilities.ui.some((channel) => channel.available)
+                : route.preferred === 'disk'
+                  ? true
+                  : null,
+          }
+        }
+        return { transport: 'api', servicesAvailable: [...available].sort(), routes: rows, uiChannels: capabilities.ui }
+      }
+      case 'guide':
+        return guide(args, logger)
+      default:
+        throw new ControllerError(`dsh_control: unknown action ${JSON.stringify(args.action)}`)
+    }
   }
 }
 

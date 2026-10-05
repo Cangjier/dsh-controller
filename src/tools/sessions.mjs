@@ -32,6 +32,20 @@ export function createSessionsTool(host, config) {
   return defineFamilyTool({
     name: SESSIONS_TOOL_NAME,
     actions: SESSIONS_ACTIONS,
+    /**
+     * 这个工具的时间预算。
+     *
+     * `wait` 与 `create` 是**故意慢**的动作，它们内部各有自己的上限，预算要按自己的上限加余量算，
+     * 不能套用 30s 的默认值——否则工具会先报超时、而 GUI 点击或等待还在底下继续，那比慢更糟。
+     */
+    timeoutFor(action, args) {
+      if (action === 'wait') {
+        const requested = Number.isFinite(args?.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : config.api.defaultWaitMs
+        return requested + 10_000
+      }
+      if (action === 'create') return config.create.clickTimeoutMs + config.create.waitMs + 30_000
+      return config.api.actionTimeoutMs
+    },
     extraProperties: {
       sessionId: { type: 'string', description: 'get / send / abort / wait / rename: the session to act on. send also accepts a cold session — it is resumed first.' },
       workspace: { type: 'string', description: 'list: an absolute workspace path, or "all" (default).' },

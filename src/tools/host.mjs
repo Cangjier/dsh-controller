@@ -29,8 +29,20 @@ export function createHostTool(host, config) {
   return defineFamilyTool({
     name: HOST_TOOL_NAME,
     actions: HOST_ACTIONS,
+    /**
+     * 这个工具的时间预算。
+     *
+     * `restart` 是这里最重的调用，它内部每一步都有自己的上限：探壳的 PowerShell 20s、看门狗的
+     * 30s、快照。预算必须大于这些之和——一个太紧的预算会在看门狗**已经起来**之后把结果掐掉，
+     * 而那时退出还在排队，调用方会以为「什么都没发生」。
+     */
+    timeoutFor(action) {
+      if (action === 'restart') return 180_000
+      if (action === 'resume') return 120_000
+      return config.api.actionTimeoutMs
+    },
     extraProperties: {
-      confirm: { type: 'boolean', description: 'restart: required (true) when config.guard.requireConfirmForRestart is on, which is the default. Say what you are about to do and get one.' },
+      confirm: { type: 'boolean', description: 'restart: required (true) unless dryRun:true, when config.guard.requireConfirmForRestart is on, which is the default. Say what you are about to do and get one.' },
       keepInbox: { type: 'boolean', description: 'pause-all / restart: true keeps queued and steering input, aborting only the running turn. Default comes from config.restart.keepInbox (false).' },
       sessionIds: { type: 'array', items: { type: 'string' }, description: 'restart / resume: continue exactly these sessions instead of the snapshot taken at restart time. Unknown ids are still attempted and reported per session.' },
       text: { type: 'string', description: 'restart / resume: the message that will be delivered to each continued session after the restart. Defaults to config.restart.resumeText.' },
@@ -51,8 +63,10 @@ export function createHostTool(host, config) {
         if (config.restart.enabled !== true) {
           throw new ControllerError('config.restart.enabled = false：重启编排被关掉了（那意味着退出之后没人恢复会话）。只想让机器安静下来就用 pause-all。')
         }
-        if (config.guard.requireConfirmForRestart && args.confirm !== true) {
-          throw new ControllerError('重启整个 DSH 需要 confirm:true（config.guard.requireConfirmForRestart 默认打开）。先说清要停掉哪些会话，再带 confirm:true 调用。')
+        // dryRun 不产生任何副作用（不写盘、不停会话、不退出），所以它不该被最重的门槛挡住：
+        // 门槛保护的是**一次真的重启**，而预演恰恰是「先说清要停掉哪些会话」的那一步。
+        if (config.guard.requireConfirmForRestart && args.confirm !== true && args.dryRun !== true) {
+          throw new ControllerError('重启整个 DSH 需要 confirm:true（config.guard.requireConfirmForRestart 默认打开）。先说清要停掉哪些会话，再带 confirm:true 调用；只想看会发生什么就用 dryRun:true，它不需要 confirm。')
         }
         return host.restartHost({
           keepInbox: args.keepInbox === true,

@@ -133,6 +133,8 @@ export function normalizeConfig(raw) {
     api: {
       forceUi: optionalBoolean(api, 'forceUi', false, 'config.api.forceUi'),
       defaultWaitMs: optionalPositiveNumber(api, 'defaultWaitMs', DEFAULT_WAIT_MS, 'config.api.defaultWaitMs'),
+      // 每次调用的时间预算：超时以一条可读的错误收口（见 shared.mjs 的 withActionTimeout）。
+      // 慢动作各自声明更大的预算，不套用这个数。
       actionTimeoutMs: optionalPositiveNumber(api, 'actionTimeoutMs', 30_000, 'config.api.actionTimeoutMs'),
     },
     // 新建会话走哪条路。默认 auto = 先 GUI、失败退 API；`api` 是纯 API 的旧行为，
@@ -272,6 +274,12 @@ function scheduleResumeCheck(host, config, logger) {
       return
     }
     if (state === 'no-plan' || state === 'same-boot' || state === 'already-done') return
+    // `arming` = 上一次重启停在快照阶段（没有请求退出），所以没有可恢复的东西。但它是
+    // 「按了重启没反应」的唯一痕迹，不该被悄悄咽掉——说出来，细节在 dsh_host {action:"status"} 里。
+    if (state === 'arming') {
+      logger.warn(`dsh-controller: 上一次 restart 停在快照阶段（计划 ${result.planPath}，${result.ageSeconds ?? '?'}s 前）：没有会话名单、没有看门狗、也没有请求退出，因此不恢复任何会话；重试 dsh_host {action:"restart"} 即可`)
+      return
+    }
     logger.info(`dsh-controller: 重启恢复 ${state} —— 成功 ${result.resumed ?? 0} 条，失败 ${result.failed ?? 0} 条（计划 ${result.planPath}）`)
   }
   timer(attempt, config.restart.resumeDelayMs)
