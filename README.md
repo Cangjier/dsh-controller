@@ -228,7 +228,8 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 ## 验证
 
 ```powershell
-node --test "tests/*.test.mjs"   # 78 个用例：配置归一化、路径编码、zstd 帧解码、工具契约、动作超时、宿主适配、重启计划与延时脚本契约
+node --test "tests/*.test.mjs"   # 93 个用例：配置归一化、路径编码、zstd 帧解码、工具契约、动作超时、宿主适配、重启计划与延时脚本契约
+node --test tests/facts.test.mjs # 事实用例：把实测结论钉死（含两条真机集成：替身进程 + 真的收树拉起）
 node selftest.mjs                # 不开 DSH 也能跑：磁盘回退 + 探测 + UI 回退找窗口 + 重启计划位置
 ```
 
