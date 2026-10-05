@@ -7,12 +7,13 @@
  * @module dsh-controller/tools
  */
 import { createControlTool } from './control.mjs'
+import { createHostTool } from './host.mjs'
 import { createPluginsTool } from './plugins.mjs'
 import { createSessionsTool } from './sessions.mjs'
 import { createUiTool } from './ui.mjs'
 
 /** 本插件注册的全部工具名，按呈现顺序。 */
-export const TOOL_NAMES = ['dsh_control', 'dsh_sessions', 'dsh_plugins', 'dsh_ui']
+export const TOOL_NAMES = ['dsh_control', 'dsh_sessions', 'dsh_host', 'dsh_plugins', 'dsh_ui']
 
 /**
  * 造全部工具定义。
@@ -25,6 +26,7 @@ export function toolDefinitions(host, config, logger) {
   return [
     createControlTool(host, config, logger),
     createSessionsTool(host, config),
+    createHostTool(host, config),
     createPluginsTool(host, config),
     createUiTool(config),
   ]

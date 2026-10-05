@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { adapter, probe, userMessage } from '../src/host/services.mjs'
+import { hostIdentity } from '../src/host/restart.mjs'
 import { normalizeConfig } from '../index.mjs'
 
 /** 一个可控的假宿主：只需要给 `get(name)`，就当作真的服务树。 */
@@ -338,4 +339,277 @@ test('userMessage 是宿主能收下的字面量形状', () => {
   assert.deepEqual(message.content, [{ type: 'text', text: 'hi' }])
   assert.equal(message.source.kind, 'cordis-host-runner')
   assert.ok(message.id.length > 0)
+})
+
+/**
+ * 造一个「两个会话在跑」的宿主：session-b 是被中止的那个，session-a 通常扮演调用者。
+ */
+function twoRunningSessions() {
+  const agents = new Map([
+    ['session-a', fakeAgent({ id: 'session-a' })],
+    ['session-b', fakeAgent({ id: 'session-b' })],
+  ])
+  const ctx = contextWith({
+    appExit: () => {},
+    sessionController: {
+      list: () => [
+        { sessionId: 'session-a', running: true, agentAvailable: true, blank: false, cwd: 'C:\\a', updatedAt: 2 },
+        { sessionId: 'session-b', running: true, agentAvailable: true, blank: false, cwd: 'C:\\b', updatedAt: 1 },
+      ],
+    },
+    agents: { get: (id) => agents.get(id) },
+  })
+  return { ctx, agents }
+}
+
+test('pauseAll 中止所有在跑的会话，但把调用者自己那条留在 deferred 里', async () => {
+  const { ctx, agents } = twoRunningSessions()
+  const host = adapter(ctx, normalizeConfig(undefined))
+
+  const result = await host.pauseAll({ callerSessionId: 'session-a' })
+  assert.equal(result.transport, 'api')
+  assert.equal(result.requested, 2)
+  assert.deepEqual(result.cancelled.map((entry) => entry.sessionId), ['session-b'])
+  assert.deepEqual(result.deferred.map((entry) => entry.sessionId), ['session-a'])
+  assert.equal(agents.get('session-b').cancelCalls.length, 1)
+  assert.equal(agents.get('session-a').cancelCalls.length, 0, '中止调用者会把本次工具结果一起带走')
+  assert.match(result.deferred[0].reason, /发起调用/)
+})
+
+test('pauseAll 的 keepInbox 一路传到 agent.cancel', async () => {
+  const { ctx, agents } = twoRunningSessions()
+  const host = adapter(ctx, normalizeConfig(undefined))
+  await host.pauseAll({ keepInbox: true })
+  assert.deepEqual(agents.get('session-b').cancelCalls[0].options, { keepInbox: true })
+  assert.deepEqual(agents.get('session-a').cancelCalls[0].options, { keepInbox: true })
+})
+
+test('restartHost：计划先落盘、看门狗先起来、退出是延迟的，调用者最后一刻才收', async () => {
+  const { ctx, agents } = twoRunningSessions()
+  const written = []
+  const timers = []
+  const exits = []
+  const host = adapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', commandLine: '"C:\\app\\DeepSeek Harness.exe"', evidence: '父进程 11368 是 DeepSeek Harness' }),
+    startWatcher: () => ({ pid: 4242, method: 'wmi', logPath: 'C:\\state\\restart-watch.log', script: 'restart-watch.ps1', shell: 'powershell.exe' }),
+    watcherAlive: async () => true,
+    writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
+    later: (fn, ms) => { timers.push({ fn, ms }); return { unref() {} } },
+    requestExit: (code) => { exits.push(code) },
+    now: () => 1_000_000,
+  })
+
+  const result = await host.restartHost({ callerSessionId: 'session-a' })
+  assert.equal(result.transport, 'api')
+  assert.equal(result.stopped.requested, 2)
+  assert.equal(result.stopped.cancelled, 1)
+  assert.equal(result.stopped.deferred, 1)
+  assert.deepEqual(result.willResume.map((entry) => entry.sessionId).sort(), ['session-a', 'session-b'])
+  assert.equal(result.exitInSeconds, 6)
+  assert.equal(agents.get('session-b').cancelCalls.length, 1)
+  assert.equal(agents.get('session-a').cancelCalls.length, 0)
+
+  // 计划是先落盘的那一份；带 watcher / exit 的是后续几次更新。
+  assert.equal(written[0].state, 'armed')
+  assert.equal(written[0].sessions.length, 2)
+  assert.equal(written[0].watcher, undefined)
+  assert.ok(written.some((plan) => plan.watcher?.pid === 4242))
+  assert.ok(written.some((plan) => plan.exit?.delaySeconds === 6))
+
+  // 退出必须是延迟的：立刻退，调用方就永远看不到这个结果。
+  assert.deepEqual(exits, [])
+  assert.equal(timers.length, 1)
+  assert.equal(timers[0].ms, 6000)
+
+  timers[0].fn()
+  for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(agents.get('session-a').cancelCalls.length, 1, '退出前一刻才收调用者')
+  assert.deepEqual(exits, [0])
+})
+
+test('restartHost 在看门狗起不来时绝不请求退出', async () => {
+  const { ctx, agents } = twoRunningSessions()
+  const written = []
+  const exits = []
+  const host = adapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    startWatcher: () => { throw new Error('powershell 起不来') },
+    writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
+    later: () => { throw new Error('不该排任何定时器') },
+    requestExit: (code) => { exits.push(code) },
+  })
+
+  await assert.rejects(() => host.restartHost({ callerSessionId: 'session-a' }), /看门狗起不来/)
+  assert.deepEqual(exits, [], '退出去回不来，比不重启更糟')
+  assert.equal(written.at(-1).state, 'failed')
+  assert.match(written.at(-1).failure, /powershell 起不来/)
+  assert.equal(agents.get('session-b').cancelCalls.length, 1, '停止已经发生了，结果里要说清楚')
+})
+
+test('restartHost 在退出前发现看门狗已经死了，就取消退出', async () => {
+  const { ctx } = twoRunningSessions()
+  const written = []
+  const exits = []
+  const timers = []
+  const host = adapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    startWatcher: () => ({ pid: 4242, method: 'wmi', logPath: 'l', script: 's', shell: 'powershell.exe' }),
+    watcherAlive: async () => false,
+    writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
+    later: (fn) => { timers.push(fn); return { unref() {} } },
+    requestExit: (code) => { exits.push(code) },
+  })
+
+  await host.restartHost({ callerSessionId: 'session-a' })
+  timers[0]()
+  for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual(exits, [], '看门狗没了还退，就等于把 DSH 关掉且没人拉起来')
+  assert.equal(written.at(-1).state, 'failed')
+  assert.match(written.at(-1).failure, /取消退出/)
+})
+
+test('restartHost 在问不出看门狗死活时（null）照常退出', async () => {
+  const { ctx } = twoRunningSessions()
+  const exits = []
+  const timers = []
+  const host = adapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    startWatcher: () => ({ pid: 4242, method: 'detached', logPath: 'l', script: 's', shell: 'powershell.exe' }),
+    watcherAlive: async () => null,
+    writePlan: (plan) => plan,
+    later: (fn) => { timers.push(fn); return { unref() {} } },
+    requestExit: (code) => { exits.push(code) },
+  })
+
+  await host.restartHost({})
+  timers[0]()
+  for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(exits, [0], '「不知道」不该被当成「不在」')
+})
+
+test('restartHost 在找不到桌面壳时什么都不做', async () => {
+  const { ctx, agents } = twoRunningSessions()
+  const host = adapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: false, mainPid: 1, exe: null, reason: '跑在 headless 的 dsh CLI 里' }),
+    startWatcher: () => { throw new Error('不该起看门狗') },
+  })
+
+  await assert.rejects(() => host.restartHost({}), /headless 的 dsh CLI/)
+  assert.equal(agents.get('session-a').cancelCalls.length, 0)
+  assert.equal(agents.get('session-b').cancelCalls.length, 0)
+})
+
+test('restartHost 的 dryRun 只快照，不停不写不退', async () => {
+  const { ctx, agents } = twoRunningSessions()
+  const written = []
+  const host = adapter(ctx, normalizeConfig(undefined), {
+    probeShell: async () => ({ ok: true, mainPid: 11368, exe: 'C:\\app\\DeepSeek Harness.exe', evidence: 'ok' }),
+    writePlan: (plan) => { written.push(plan); return plan },
+    startWatcher: () => { throw new Error('dryRun 不该起看门狗') },
+  })
+
+  const result = await host.restartHost({ dryRun: true })
+  assert.equal(result.dryRun, true)
+  assert.equal(result.wouldStop.length, 2)
+  assert.equal(result.wouldResume.length, 2)
+  assert.deepEqual(written, [])
+  assert.equal(agents.get('session-a').cancelCalls.length, 0)
+  assert.equal(agents.get('session-b').cancelCalls.length, 0)
+})
+
+test('resumeAfterRestart 只在别的进程写的计划上投递，并且先 claim 再投', async () => {
+  const agent = fakeAgent({ id: 'session-b' })
+  const written = []
+  const plan = {
+    version: 1,
+    id: 'restart-1',
+    state: 'armed',
+    createdAtMs: 1000,
+    writer: { pid: 111, bootEpochMs: 500 },
+    resume: { text: '继续上次未完成的工作。', max: 20 },
+    sessions: [{ sessionId: 'session-b' }],
+    outcomes: [],
+  }
+  const host = adapter(contextWith({
+    sessionController: { resolveAgent: async () => ({ agent }) },
+    sessions: { flush: async () => true },
+  }), normalizeConfig(undefined), {
+    readPlan: () => ({ plan: JSON.parse(JSON.stringify(plan)), path: 'C:\\state\\restart-plan.json', error: null }),
+    writePlan: (next) => { written.push(JSON.parse(JSON.stringify(next))); return next },
+    now: () => 5000,
+  })
+
+  const result = await host.resumeAfterRestart()
+  assert.equal(result.state, 'done')
+  assert.equal(result.resumed, 1)
+  assert.equal(result.failed, 0)
+  assert.equal(agent.followupCalls.length, 1)
+  assert.equal(agent.followupCalls[0].content[0].text, '继续上次未完成的工作。')
+  assert.equal(written[0].state, 'claimed', '先记账再投递，才不会有第二次重复投递')
+  assert.equal(written.at(-1).state, 'done')
+  assert.deepEqual(result.outcomes, [{ sessionId: 'session-b', ok: true, transport: 'api', flushed: true }])
+})
+
+test('resumeAfterRestart 拒绝恢复「当前这个进程」写下的计划', async () => {
+  let resolveCalls = 0
+  const host = adapter(contextWith({
+    sessionController: { resolveAgent: async () => { resolveCalls += 1; return { agent: fakeAgent() } } },
+  }), normalizeConfig(undefined), {
+    readPlan: () => ({
+      plan: { version: 1, state: 'armed', createdAtMs: 0, writer: hostIdentity(), resume: { text: 'x' }, sessions: [{ sessionId: 's' }], outcomes: [] },
+      path: 'p',
+      error: null,
+    }),
+    writePlan: (plan) => plan,
+  })
+
+  const result = await host.resumeAfterRestart()
+  assert.equal(result.state, 'same-boot')
+  assert.equal(resolveCalls, 0, '插件热重载不该把消息再投一遍')
+})
+
+test('resumeAfterRestart 对过期计划改成 expired，而不是突然把会话全都点着', async () => {
+  const written = []
+  const host = adapter(contextWith({ sessionController: { resolveAgent: async () => ({ agent: fakeAgent() }) } }), normalizeConfig({ restart: { planTtlSeconds: 10 } }), {
+    readPlan: () => ({
+      plan: { version: 1, state: 'armed', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, resume: { text: 'x' }, sessions: [{ sessionId: 's' }], outcomes: [] },
+      path: 'p',
+      error: null,
+    }),
+    writePlan: (plan) => { written.push(JSON.parse(JSON.stringify(plan))); return plan },
+    now: () => 60_000,
+  })
+
+  const result = await host.resumeAfterRestart()
+  assert.equal(result.state, 'expired')
+  assert.equal(written.at(-1).state, 'expired')
+})
+
+test('resumeAfterRestart 在服务还没装配好时给出可重试的信号', async () => {
+  const host = adapter(contextWith({}), normalizeConfig(undefined), {
+    readPlan: () => ({
+      plan: { version: 1, state: 'armed', createdAtMs: 0, writer: { pid: 1, bootEpochMs: 1 }, resume: { text: 'x' }, sessions: [{ sessionId: 's' }], outcomes: [] },
+      path: 'p',
+      error: null,
+    }),
+    writePlan: (plan) => plan,
+    now: () => 1000,
+  })
+
+  const result = await host.resumeAfterRestart()
+  assert.equal(result.state, 'services-not-ready')
+  assert.equal(result.retryable, true)
+})
+
+test('restartStatus 在没有计划时说清楚没有，而不是编一个', async () => {
+  const host = adapter(contextWith({}), normalizeConfig(undefined), {
+    readPlan: () => ({ plan: null, path: 'C:\\state\\restart-plan.json', error: null }),
+  })
+  const result = await host.restartStatus()
+  assert.equal(result.transport, 'disk')
+  assert.equal(result.plan, null)
+  assert.match(result.note, /没有重启计划/)
+  assert.equal(typeof result.watcherLog.exists, 'boolean')
+  assert.equal(typeof result.currentHost.pid, 'number')
 })

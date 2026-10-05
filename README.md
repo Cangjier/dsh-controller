@@ -57,12 +57,13 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 脚本会在「输入框里已有草稿」（`composer-not-empty`，用回读像素判定）或「正文非 ASCII」
 （`text-not-ascii`）时明确拒绝，而不是把两段话接在一起。
 
-## 四个工具
+## 五个工具
 
 | 工具 | 动作 | 走哪条路 |
 | --- | --- | --- |
 | `dsh_control` | `overview` `capabilities` `session` `transport` `guide` | 只读；`capabilities` 逐项探测 18 个服务与两条 UI 通道 |
 | `dsh_sessions` | `list` `get` `create` `send` `abort` `wait` `rename` | `sessionController` / `agents` / `sessions` / `sessionTitle` |
+| `dsh_host` | `pause-all` `restart` `status` `resume` | 停止与继续走 `agents` / `sessionController`；退出走 `ctx.appExit`；**重新拉起由进程外的看门狗完成**；`status` 只读磁盘 |
 | `dsh_plugins` | `list` `inventory` `enable` `disable` `install` `remove` `inspect` `log` | `pluginManager`；`log` 只能读磁盘 |
 | `dsh_ui` | `window` `look` `click` `type` `key` `scroll` | 桌面自动化（最后手段） |
 
@@ -70,13 +71,56 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 （`src/tools/registry.mjs`）是这些 prose 的**唯一来源**，而且加载时会双向核对：动作声明了没文档、或文档
 里写了没实现，都会直接抛错。
 
+## 停掉全部并重启（`dsh_host`）
+
+「把所有对话停下来 → 重启 DSH → 接着干」是一次调用：
+
+```jsonc
+// dsh_host {action:"restart", confirm:true}
+{ "transport": "api", "restartId": "restart-…", "exitInSeconds": 6,
+  "stopped": { "requested": 3, "cancelled": 2, "failed": 0, "deferred": 1 },
+  "willResume": [ { "sessionId": "session-…", "wasRunning": true } ],
+  "watcher": { "pid": 4242, "logPath": "C:\\Users\\…\\.dsh\\controller\\restart-watch.log" } }
+```
+
+**顺序就是安全边界**，少一步都不行：
+
+1. **先证伪**——父进程的 exe 必须就是本进程所在的那个 exe，且命令行里没有 `--expose-internals`：
+   证明「退出去之后有东西可以重新拉起」。跑在 headless 的 `dsh` CLI 里时这一步就失败，于是明确拒绝。
+2. **快照**——重启前 `running: true` 的会话就是重启后要接着跑的名单。
+3. **停止**——立即 `agent.cancel()`，逐条报成功/失败。**发起调用的那条会话除外**：中止它会把正在执行
+   本次调用的那一轮一起收掉，工具结果就再也送不回去；它排在退出前一刻收。
+4. **计划落盘**——`<DSH home>/controller/restart-plan.json`。退出之后没有任何代码能补写，所以它必须先写。
+5. **看门狗先起来**——它**不属于 DSH 的进程树**：优先用 WMI（`Win32_Process.Create`）起，新进程的父进程
+   是 `WmiPrvSE.exe`（实测），所以即使桌面壳用 kill-on-close 的 Job Object 收子进程也带不走它；WMI 不可用
+   时才退回 `detached` spawn。它起不来就**不请求退出**：宁可重启没发生，也不要退出去回不来。
+6. **延迟退出**——默认 6 秒后才 `ctx.appExit(0)`，为的就是让上面的结果先送达调用方。退出前还会回读一次
+   看门狗是否还活着（`probeWatcherAlive`），它已经不在了就取消退出——退出去且没人拉起来是最坏的结局。
+
+看门狗只做一件事：等主进程 PID 消失 → 再等 `settleMs` 让日志写完 → 确认没有同名进程残留 →
+`Start-Process` 拉起 exe。超时还没退，它**放弃并且不启动第二个实例**（退 3），因为两个 DSH 抢同一个
+profile 比重启失败更糟。
+
+重启后的恢复腿挂在 bundle 加载期：读那份计划，`sessionController` 还没装配就每 3 秒重试（最多
+`resumeWaitMs`），然后对每条会话 `resolveAgent + followup` 投一条「继续」（默认正文
+`继续上次未完成的工作。`）。三条自我约束：
+
+- **只有别的进程写的计划才会投递**：`pid` 与进程启动时刻一起比对，所以插件热重载不会把消息重投一遍；
+- **先 claim 再投**：投递前把状态写成 `claimed` 落盘，投到一半崩了也不会从头再来一遍；
+- **过期不恢复**：超过 `planTtlSeconds`（默认 15 分钟）的计划改成 `expired`，隔夜才打开的应用不会突然满血复活。
+
+`dsh_host {action:"status"}` 读的就是那份计划与看门狗日志（`transport: "disk"`——它们只存在于磁盘上，
+这不是降级，而是唯一存在的地方）。想只看不动，用 `restart {dryRun:true, confirm:true}`：它照样会跑
+「先证伪」那一步，所以「这台机器上到底能不能重启」在没有副作用的情况下就能问出答案。
+
 ## 三层通道与降级顺序
 
 ```
-1. api    cordis 服务          最准；能确认落盘、能报 restart-required
-2. disk   ~/.dsh 下的真实文件  服务缺席时仍然能读会话状态、能读插件操作日志
-3. cli    `dsh plugin …`       pluginManager 缺席时安装/卸载的退路（见下）
-4. ui     真实鼠标键盘          只有 GUI 才有的东西
+1. api      cordis 服务          最准；能确认落盘、能报 restart-required
+2. disk     ~/.dsh 下的真实文件  服务缺席时仍然能读会话状态、能读插件操作日志
+3. cli      `dsh plugin …`       pluginManager 缺席时安装/卸载的退路（见下）
+4. ui       真实鼠标键盘          只有 GUI 才有的东西
+5. process  DSH 之外的进程        重启看门狗：退出之后唯一还活着、能把应用拉起来的东西
 ```
 
 `dsh_control {action:"capabilities"}` 会把当前进程实测结果摆出来（含每个服务原型上的方法名——版本之间
@@ -94,7 +138,7 @@ pnpm add "C:\Users\Admin\Documents\GitHub\dsh-plugins\dsh-controller"
 ```
 
 第二步之后运行中的桌面应用会重载 profile 配置并把 `dsh_*` 工具注册进来——**不需要重启应用**（实测：
-包名写进 `bundles` 后，同一轮对话的下一次请求就看到了这四个工具）。
+包名写进 `bundles` 后，同一轮对话的下一次请求就看到了这五个工具）。
 
 **改插件源码需要重启应用。** HMR 默认 `root: []`，只监听配置不监听模块；要把插件目录登记成模块根：
 
@@ -128,14 +172,24 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 | `ui.focusSettleMs` | `120` | 前台化后等待多久再确认 |
 | `guard.requireConfirmForCreate` | `false` | 建会话是否必须带 `confirm:true` |
 | `guard.requireConfirmForPlugins` | `true` | 改插件状态是否必须带 `confirm:true` |
+| `guard.requireConfirmForRestart` | `true` | `dsh_host {action:"restart"}` 是否必须带 `confirm:true` |
+| `restart.enabled` | `true` | 启动时是否检查并执行恢复计划 |
+| `restart.delaySeconds` | `6` | 请求退出前的延迟：本次工具结果要先送达 |
+| `restart.watcherTimeoutSeconds` | `180` | 看门狗等主进程退出的上限；到点放弃，不启动第二个实例 |
+| `restart.settleMs` | `1500` | 主进程退出后再等多久才拉起（让会话日志写完） |
+| `restart.maxResume` | `20` | 一次最多自动继续多少条会话 |
+| `restart.planTtlSeconds` | `900` | 计划的有效期；过期不再恢复 |
+| `restart.resumeText` | `继续上次未完成的工作。` | 重启后投给每条会话的正文 |
+| `restart.keepInbox` | `false` | 中止会话时是否保留排队/引导消息 |
+| `restart.resumeDelayMs` / `resumeWaitMs` | `4000` / `180000` | 启动后多久开始检查恢复、最多等宿主装配多久 |
 
 配置写错在**加载时**抛错，不留到调用时；一个悄悄用着默认值的插件比一个加载失败的插件更难查。
 
 ## 验证
 
 ```powershell
-node --test "tests/*.test.mjs"   # 40 个用例：配置归一化、路径编码、zstd 帧解码、工具契约、宿主适配
-node selftest.mjs                # 不开 DSH 也能跑：磁盘回退 + 探测 + UI 回退找窗口
+node --test "tests/*.test.mjs"   # 64 个用例：配置归一化、路径编码、zstd 帧解码、工具契约、宿主适配、重启计划
+node selftest.mjs                # 不开 DSH 也能跑：磁盘回退 + 探测 + UI 回退找窗口 + 重启计划位置
 ```
 
 自检里有一项值得一提：磁盘回退能在一台**没开 DSH** 的机器上列出全部会话（本次实测 462 条 / 2 条在跑），
@@ -143,12 +197,22 @@ node selftest.mjs                # 不开 DSH 也能跑：磁盘回退 + 探测 
 
 ## 已知边界
 
-- **不能重启宿主，也不能卸载自己**。DSH 没有公开的 restart API（`reconcileProfilePatches` + `hmr` 是
-  私有的），Electron 那一侧只走 Node IPC。所以 `dsh_plugins` 报的是 `restart-required`，而不是假装成功了。
+- **重启是「进程外」完成的，而且只认桌面壳**。DSH 没有公开的 restart API：桌面壳自己的「重启应用与
+  Host」是 Electron 侧的 `app.relaunch() + exit()`，Host 只拿得到 `ctx.appExit`——它能请求退出，但退出
+  之后没有任何代码还活着去把应用拉起来。所以本插件写计划 + 起看门狗 + 延迟退出三步走。**跑在 headless
+  的 `dsh` CLI 里时它会明确拒绝**（那时看不到桌面壳，退出就回不来），而不是赌一把。
+- **看门狗的存活方式是量出来的，不是假设的**。WMI 起的进程父进程是 `WmiPrvSE.exe`（实测），所以它不在
+  DSH 的进程树里；`detached` 只是退路。仍有残余风险：如果壳在退出时把**整个用户会话**里的进程都收走
+  （目前没有观察到），重启就不会自动发生——那种情况下的兜底是「计划仍在盘上」，你手动打开 DSH 后恢复腿
+  照样会把那些会话继续起来。
 - **`state` 是推断出来的**。`RUNNING` / `IDLE` / `STALLED` 来自「回合边界 + 文件 mtime」；一个刚崩掉的
   会话最多 5 分钟会被报成 `RUNNING`。要看内存里的权威状态，用 `dsh_control {action:"session"}` 的
-  `live.status`。
-- **`dsh_sessions {action:"abort"}` 是破坏性的**：被中止的那一轮以 `aborted` 收口，未完成的工作不会重来。
+  `live.status`。**重启快照用的是宿主口径**（`sessionController.list()` 的 `running`），只有在退到磁盘
+  扫描时才带上 `staleRisk: true`。
+- **`dsh_sessions {action:"abort"}` 与 `dsh_host {action:"pause-all"}` 都是破坏性的**：被中止的那一轮以
+  `aborted` 收口，未完成的工作不会重来（重启那次的「继续」是重新开始一轮，不是接着半个工具调用跑）。
+- **「继续」是一次新的模型调用**。重启后自动继续 N 条会话就是 N 个新回合，会真的花钱花时间，所以有
+  `restart.maxResume` 这个上限，而且范围默认只覆盖「重启前真的在跑」的那些。
 - **`dsh_ui` 动的是真机器**：`click` / `type` / `key` / `scroll` 会抢焦点、覆盖剪贴板（中文走粘贴）。
   没确认前台就拒绝发输入，这是它唯一的一条硬规则。
 - **`dsh_plugins {action:"list"}` 默认裁剪字段**。不裁的话一次 list 约 140 KB（每个插件都带描述，实验包

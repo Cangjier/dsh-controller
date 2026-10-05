@@ -41,6 +41,17 @@ export function pluginTmp(pluginRoot) {
 }
 
 /**
+ * 插件在 DSH 家目录下的状态目录：重启计划与看门狗日志放这里。
+ *
+ * 放在家目录而不是插件仓库里，因为重启恢复要跨进程读同一份文件，而插件仓库可能是个
+ * 只读安装（装进 profile 的包）——`DSH_CONTROLLER_DIR` 可以把这份状态搬走。
+ * @returns {string} 目录绝对路径。
+ */
+export function controllerStateDir() {
+  return process.env.DSH_CONTROLLER_DIR ?? join(dshHome(), 'controller')
+}
+
+/**
  * 把一个工作区绝对路径编码成 DSH 的目录名。
  *
  * 规则是**实测**出来的，不是文档里的：`C:\Users\Admin\Documents\GitHub\xl-example`

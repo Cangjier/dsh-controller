@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert'
 import test from 'node:test'
 import { TOOL_NAMES, toolDefinitions } from '../src/tools/index.mjs'
 import { TOOLS } from '../src/tools/registry.mjs'
+import { createHostTool } from '../src/tools/host.mjs'
 import { ControllerError, defineFamilyTool } from '../src/tools/shared.mjs'
 import { adapter } from '../src/host/services.mjs'
 import { normalizeConfig } from '../index.mjs'
@@ -17,9 +18,10 @@ test('注册表与注册的工具一一对应', () => {
   assert.deepEqual(Object.keys(TOOLS).sort(), [...TOOL_NAMES].sort())
 })
 
-test('四个工具都造得出来，并且 schema 形状正确', () => {
+test('五个工具都造得出来，并且 schema 形状正确', () => {
   const definitions = toolDefinitions(emptyHost(), normalizeConfig(undefined), logger)
   assert.deepEqual(definitions.map((definition) => definition.name), TOOL_NAMES)
+  assert.equal(definitions.length, 5)
   for (const definition of definitions) {
     assert.equal(typeof definition.description, 'string')
     assert.ok(definition.description.includes('Full detail: dsh_control {action:"guide"'))
@@ -103,6 +105,50 @@ test('send 的参数校验在碰宿主之前完成', async () => {
   const sessions = definitions.find((definition) => definition.name === 'dsh_sessions')
   await assert.rejects(() => sessions.execute({ action: 'send', text: '你好' }, {}), /需要 sessionId/)
   await assert.rejects(() => sessions.execute({ action: 'send', sessionId: 's' }, {}), /需要非空的 text/)
+})
+
+test('restart 的确认门槛默认打开，过了门槛才碰宿主', async () => {
+  const calls = []
+  const stub = {
+    pauseAll: async (args) => { calls.push(['pause-all', args]); return { transport: 'api', requested: 0, cancelled: [], failed: [], deferred: [] } },
+    restartHost: async (args) => { calls.push(['restart', args]); return { transport: 'api', dryRun: true } },
+    restartStatus: async () => ({ transport: 'disk' }),
+    resumeAfterRestart: async (args) => { calls.push(['resume', args]); return { transport: 'api', state: 'no-plan' } },
+  }
+
+  const strict = createHostTool(stub, normalizeConfig({ guard: { requireConfirmForRestart: true } }))
+  await assert.rejects(() => strict.execute({ action: 'restart', dryRun: true }, {}), /需要 confirm:true/)
+  assert.equal(calls.length, 0, '门槛没过就一步都不该碰宿主')
+
+  await strict.execute({ action: 'restart', confirm: true, dryRun: true }, {})
+  assert.deepEqual(calls.map(([name]) => name), ['restart'])
+  assert.equal(calls[0][1].dryRun, true)
+
+  // 调用者身份要一路传下去：restart / pause-all 靠它把「自己那一轮」留到退出前才收。
+  const loose = createHostTool(stub, normalizeConfig({ guard: { requireConfirmForRestart: false } }))
+  await loose.execute({ action: 'pause-all' }, { agent: { session: { id: 'session-self' } } })
+  assert.equal(calls.at(-1)[0], 'pause-all')
+  assert.equal(calls.at(-1)[1].callerSessionId, 'session-self')
+
+  // 关掉重启编排 = 连按都不给按：退出之后没人恢复会话，这不该是个「悄悄少了后半段」的选项。
+  const disabled = createHostTool(stub, normalizeConfig({ restart: { enabled: false }, guard: { requireConfirmForRestart: false } }))
+  await assert.rejects(() => disabled.execute({ action: 'restart', confirm: true }, {}), /重启编排被关掉了/)
+  await disabled.execute({ action: 'pause-all' }, {})
+})
+
+test('dsh_host 的 guide 说清 restart 要 confirm，并且路由写明重新拉起由进程外完成', async () => {
+  const definitions = toolDefinitions(emptyHost(), normalizeConfig(undefined), logger)
+  const control = definitions.find((definition) => definition.name === 'dsh_control')
+
+  const guide = await control.execute({ action: 'guide', tool: 'dsh_host', actionName: 'restart' }, {})
+  assert.deepEqual(guide.required, ['confirm'])
+  assert.equal(guide.route.preferred, 'api')
+  assert.equal(guide.route.fallback, 'process')
+  assert.ok(guide.detail.some((line) => line.includes('看门狗')))
+
+  const transport = await control.execute({ action: 'transport' }, {})
+  assert.equal(transport.routes['dsh_host.status'].preferred, 'disk')
+  assert.equal(transport.routes['dsh_host.restart'].fallback, 'process')
 })
 
 test('每个动作的结果都带 transport，除非它本来就不碰宿主', async () => {

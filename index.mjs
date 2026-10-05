@@ -125,6 +125,7 @@ export function normalizeConfig(raw) {
   const ui = config.ui ?? {}
   const guard = config.guard ?? {}
   const create = config.create ?? {}
+  const restart = config.restart ?? {}
 
   const screenshotDir = optionalString(ui, 'screenshotDir', null, 'config.ui.screenshotDir')
   return {
@@ -161,9 +162,33 @@ export function normalizeConfig(raw) {
       scriptTimeoutMs: optionalPositiveNumber(ui, 'scriptTimeoutMs', DEFAULT_SCRIPT_TIMEOUT_MS, 'config.ui.scriptTimeoutMs'),
       focusSettleMs: optionalPositiveNumber(ui, 'focusSettleMs', 120, 'config.ui.focusSettleMs'),
     },
+    // 重启编排：停止全部会话 → 退出 → 由分离看门狗重新拉起 → 按落盘的计划继续那些会话。
+    // 计划放在 `<DSH home>/controller/`，所以「重启前的那个进程」和「重启后的新进程」读的是同一份。
+    restart: {
+      enabled: optionalBoolean(restart, 'enabled', true, 'config.restart.enabled'),
+      // 请求退出前的延迟：本次工具结果要先送达调用方，所以退出不能是立即的。
+      delaySeconds: optionalPositiveNumber(restart, 'delaySeconds', 6, 'config.restart.delaySeconds'),
+      // 看门狗等主进程退出的上限；到点还没退就放弃，绝不启动第二个实例。
+      watcherTimeoutSeconds: optionalPositiveNumber(restart, 'watcherTimeoutSeconds', 180, 'config.restart.watcherTimeoutSeconds'),
+      // 主进程退出后再等多久才拉起（让会话日志写完）。
+      settleMs: optionalPositiveNumber(restart, 'settleMs', 1500, 'config.restart.settleMs'),
+      // 一次最多自动继续多少条会话：防止一次重启把一大片会话同时点着。
+      maxResume: optionalPositiveNumber(restart, 'maxResume', 20, 'config.restart.maxResume'),
+      // 计划的有效期：超过它就不恢复了（一个隔夜才被打开的计划不该突然满血复活）。
+      planTtlSeconds: optionalPositiveNumber(restart, 'planTtlSeconds', 900, 'config.restart.planTtlSeconds'),
+      // 自动继续时投的那条消息。
+      resumeText: optionalString(restart, 'resumeText', '继续上次未完成的工作。', 'config.restart.resumeText'),
+      // 中止会话时是否保留排队/引导消息。
+      keepInbox: optionalBoolean(restart, 'keepInbox', false, 'config.restart.keepInbox'),
+      // 启动后多久开始检查恢复计划（给宿主装配服务留时间），以及最多等多久。
+      resumeDelayMs: optionalPositiveNumber(restart, 'resumeDelayMs', 4000, 'config.restart.resumeDelayMs'),
+      resumeWaitMs: optionalPositiveNumber(restart, 'resumeWaitMs', 180_000, 'config.restart.resumeWaitMs'),
+    },
     guard: {
       requireConfirmForCreate: optionalBoolean(guard, 'requireConfirmForCreate', false, 'config.guard.requireConfirmForCreate'),
       requireConfirmForPlugins: optionalBoolean(guard, 'requireConfirmForPlugins', true, 'config.guard.requireConfirmForPlugins'),
+      // 默认 true：重启整个应用是这台机器上最重的动作，必须显式 confirm。
+      requireConfirmForRestart: optionalBoolean(guard, 'requireConfirmForRestart', true, 'config.guard.requireConfirmForRestart'),
     },
   }
 }
@@ -199,4 +224,55 @@ export function apply(ctx, rawConfig) {
       ctx.logger.error('dsh-controller: 没有注册任何工具，插件实际上不可用')
     }
   })
+
+  // 重启后的恢复腿：计划是上一个进程写的，投递发生在这个进程——所以它挂在加载期，
+  // 而不是某个工具动作里。
+  if (config.restart.enabled) scheduleResumeCheck(host, config, ctx.logger)
+}
+
+/** 一次性定时器；`unref` 让一个正在退出的进程不必为一个等待而多活。 */
+function timer(fn, ms) {
+  const handle = setTimeout(() => { void fn() }, ms)
+  handle.unref?.()
+  return handle
+}
+
+/**
+ * 启动时检查有没有「重启前留下的恢复计划」，有就按它继续那些会话。
+ *
+ * 三条自我约束：
+ *   - 宿主刚起来时 `sessionController` 可能还没装配，所以 `services-not-ready` 是重试信号，
+ *     不是失败；重试到 `resumeWaitMs` 为止，之后放弃并说明计划还在盘上（可以手动 `resume`）。
+ *   - 只有**别的进程**写的计划才会投递（`resumeAfterRestart` 里的 `sameBoot` 判定），
+ *     所以插件热重载不会把消息重投一遍。
+ *   - 没有计划、计划是本次启动写的、或已经恢复过，都安静地什么也不做——启动日志不该
+ *     每次都喊一句「没有计划」。
+ * @param {object} host - 宿主适配器。
+ * @param {object} config - 归一化后的配置。
+ * @param {object} logger - 插件 logger。
+ * @returns {void}
+ */
+function scheduleResumeCheck(host, config, logger) {
+  const startedAt = Date.now()
+  const attempt = async () => {
+    let result
+    try {
+      result = await host.resumeAfterRestart()
+    } catch (error) {
+      logger.warn(`dsh-controller: 重启恢复出错：${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    const state = result?.state
+    if (state === 'services-not-ready') {
+      if (Date.now() - startedAt >= config.restart.resumeWaitMs) {
+        logger.warn(`dsh-controller: 重启恢复放弃：等了 ${Math.round(config.restart.resumeWaitMs / 1000)}s，sessionController 仍未就绪；计划仍在 ${result.planPath}，可用 dsh_host {action:"resume"} 手动恢复`)
+        return
+      }
+      timer(attempt, 3000)
+      return
+    }
+    if (state === 'no-plan' || state === 'same-boot' || state === 'already-done') return
+    logger.info(`dsh-controller: 重启恢复 ${state} —— 成功 ${result.resumed ?? 0} 条，失败 ${result.failed ?? 0} 条（计划 ${result.planPath}）`)
+  }
+  timer(attempt, config.restart.resumeDelayMs)
 }

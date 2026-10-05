@@ -2,10 +2,12 @@
  * 自检：不开 DSH 也能跑，用来证明「插件本身是活的」。
  *
  * 它做四件事，每一件都打印原始证据而不是结论：
- *   1. 归一化配置并列出四个工具的 schema 摘要；
+ *   1. 归一化配置并列出五个工具的 schema 摘要；
  *   2. 用一个**什么都不提供**的宿主跑一遍磁盘回退（overview + 会话列表）；
  *   3. 用当前进程的虚假宿主跑 capabilities，看看在这台机器上探测到了什么；
  *   4. 跑一次 UI 回退的 `window` 动作（**不动窗口**，只观察）。
+ *
+ * 它还会报出重启计划的位置与状态——那份计划是跨进程的事实，值得单独看一眼。
  *
  * 用法：node selftest.mjs
  */
@@ -13,7 +15,8 @@ import { adapter, probe } from './src/host/services.mjs'
 import { toolDefinitions } from './src/tools/index.mjs'
 import { normalizeConfig } from './index.mjs'
 import { runDesktop } from './src/ui/desktop.mjs'
-import { dshHome, profileDir } from './src/host/paths.mjs'
+import { controllerStateDir, dshHome, profileDir } from './src/host/paths.mjs'
+import { readPlanResult } from './src/host/restart.mjs'
 
 const logger = { info: (message) => console.log(`[info] ${message}`), warn: (message) => console.log(`[warn] ${message}`), error: (message) => console.log(`[error] ${message}`) }
 const config = normalizeConfig(undefined)
@@ -61,5 +64,20 @@ if (process.platform !== 'win32') {
     matches: Array.isArray(window.matches) ? window.matches.length : 0,
   }, null, 2))
 }
+
+console.log('\n=== 5. 重启计划（跨进程的那份事实）===')
+const plan = readPlanResult()
+console.log(JSON.stringify({
+  stateDir: controllerStateDir(),
+  planPath: plan.path,
+  plan: plan.plan === null ? null : {
+    id: plan.plan.id ?? null,
+    state: plan.plan.state ?? null,
+    createdAt: plan.plan.createdAt ?? null,
+    sessions: Array.isArray(plan.plan.sessions) ? plan.plan.sessions.length : 0,
+    outcomes: Array.isArray(plan.plan.outcomes) ? plan.plan.outcomes.length : 0,
+  },
+  error: plan.error,
+}, null, 2))
 
 console.log('\n自检结束。上面任何一项写 "null" 都是「这台机器上没有」，不是失败。')

@@ -14,15 +14,15 @@
  * @module dsh-controller/tools/registry
  */
 
-/** 传输：这个动作实际走的是哪条路。 */
-export const TRANSPORTS = ['api', 'ui']
+/** 传输：这个动作实际走的是哪条路。`process` = 由 DSH 之外的进程（重启看门狗）完成。 */
+export const TRANSPORTS = ['api', 'ui', 'disk', 'process']
 
 /** 所有工具的文档条目，键就是工具的注册名。 */
 export const TOOLS = {
   dsh_control: {
     purpose: 'Read what DSH itself is: version, home, profile, default model, sandbox, workspaces, sessions, and which of DSH\'s own services this process can actually reach. Read-only — nothing here changes any state.',
     needs: 'nothing beyond the plugin being loaded; every field degrades to a stated absence instead of failing.',
-    next: 'dsh_sessions to act on a session, dsh_plugins to manage plugins, dsh_ui when only the GUI exposes the thing you need.',
+    next: 'dsh_sessions to act on a session, dsh_host to stop or restart DSH itself, dsh_plugins to manage plugins, dsh_ui when only the GUI exposes the thing you need.',
     actions: {
       overview: {
         summary: 'DSH 自身的概览：版本、家目录、profile、默认模型、沙箱模式、工作区数、会话数、正在跑的会话数。',
@@ -150,6 +150,66 @@ export const TOOLS = {
         summary: '改一条会话的标题。',
         required: ['sessionId', 'title'],
         detail: ['实现走 `ctx.sessionTitle.rename(session, title)`；会话冷着时先 resolve。'],
+      },
+    },
+  },
+
+  dsh_host: {
+    purpose: 'Stop and restart DSH itself: abort every running conversation, write a resume plan, exit the app, let a detached watchdog start it again, and continue the conversations that were running before the restart.',
+    needs: 'the `appExit` entry on the host context and a desktop shell whose executable can be identified; `agents`/`sessionController` to actually stop and continue conversations. A headless `dsh` process is refused rather than exited.',
+    next: 'dsh_host {action:"status"} after the restart to read the plan and the watchdog log; dsh_sessions {action:"list"} to see what came back.',
+    actions: {
+      'pause-all': {
+        summary: '立即中止所有正在跑的回合（调用者自己那条除外，它由调用方决定）。',
+        use: '只想让机器安静下来、不重启时用它。',
+        detail: [
+          '参数：`keepInbox`（默认取 `config.restart.keepInbox`，false = 连排队一起清掉）。',
+          '返回 `{ requested, cancelled, failed, deferred, source, staleRisk, truncated }`。',
+          '**调用者自己那条会话不会在这里被中止**：`agent.cancel()` 会把正在执行本次调用的那一轮',
+          '一起收掉，工具结果就再也没有送达的机会。它出现在 `deferred` 里，并注明原因。',
+          '「在跑」取 `sessionController.list()` 的 `running`；退到磁盘扫描时 `staleRisk: true`，',
+          '因为磁盘上「回合没闭合」也可能是上次崩溃留下的。',
+        ],
+      },
+      restart: {
+        summary: '停止所有会话 → 落盘恢复计划 → 起分离看门狗 → 延迟退出 DSH；重启后按计划继续那些会话。',
+        required: ['confirm'],
+        risk: '会中止所有正在跑的对话、退出整个 DSH，并让重启后的会话自动开始新回合（消耗模型额度）。',
+        use: '需要一次干净的重启、但不想丢掉手上正在跑的活时。',
+        detail: [
+          '参数：`confirm`（`config.guard.requireConfirmForRestart` 默认 true，必须显式给）、',
+          '`keepInbox`、`text`（重启后投给每条会话的正文，默认 `继续上次未完成的工作。`）、',
+          '`delaySeconds`（默认 6：本次工具结果要先送达，退出不能是立即的）、',
+          '`sessionIds`（覆盖「继续哪些」）、`dryRun`（只快照，不停不退）。',
+          '**顺序即安全**：先证明桌面壳找得到（父进程 exe 必须就是本进程所在的那个 exe，且命令行',
+          '里没有 `--expose-internals`），再快照、再停止、再把计划落盘（`<DSH home>/controller/restart-plan.json`），',
+          '再看门狗起来，最后才延迟退出。看门狗起不来就**不退出**——宁可重启没发生，也不要退出去回不来。',
+          '**看门狗在 DSH 的进程树之外**：优先用 WMI（`Win32_Process.Create`）起，新进程的父进程是',
+          '`WmiPrvSE.exe`（实测），所以即使桌面壳用 kill-on-close 的 Job Object 收子进程也带不走它；',
+          'WMI 不可用时退回 `detached` spawn。它等主进程 PID 消失，然后再启动 exe；主进程在超时内没退就',
+          '放弃，绝不启动第二个实例去抢同一个 profile。退出前还会回读一次看门狗是否还活着——它没了就取消退出。',
+          '**谁是「要继续的会话」**：重启前真的在跑的（`running: true`）。重启后恢复腿只投一条',
+          '「继续」followup，然后它自己接着干；计划里逐条记 `outcomes`。',
+        ],
+      },
+      status: {
+        summary: '上次重启计划的状态、看门狗日志，以及这份计划是不是当前这个进程写的。',
+        detail: [
+          '返回 `{ plan: { state, shell, watcher, stop, sessions, outcomes, resumedAt, failure }, belongsToCurrentBoot, watcherLog, currentHost }`。',
+          '`state` 的取值：`armed`（已落盘、等退出）、`claimed`（恢复已开始投递）、`done` / `partial` /',
+          '`failed`（恢复结果）、`expired`（超过 `config.restart.planTtlSeconds` 没被处理）、',
+          '`failed` + `failure`（看门狗或退出请求失败）。',
+          '`belongsToCurrentBoot: true` 说明这份计划就是当前进程写的——那意味着退出还没发生。',
+        ],
+      },
+      resume: {
+        summary: '手动执行恢复腿：按计划把会话重新驱动起来（正常情况启动时自动做完）。',
+        detail: [
+          '参数：`sessionIds`（默认用计划里的名单）、`text`、`max`（默认 `config.restart.maxResume`）、',
+          '`force`（跳过「计划属于当前进程」的保护，仅用于手动重跑）。',
+          '投递前先把计划改成 `claimed` 落盘，所以中途失败也不会在下次启动时把已投的再投一遍。',
+          '服务还没装配好时返回 `state: "services-not-ready"`，这是重试信号而不是失败。',
+        ],
       },
     },
   },

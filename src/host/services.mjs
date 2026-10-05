@@ -17,6 +17,19 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { dshHome, profileDir, profileName } from './paths.mjs'
 import { listSessionLogs, readLog, readProjection, summarizeFromDisk } from './sessionlog.mjs'
+import {
+  PLAN_VERSION,
+  hostIdentity,
+  planPath,
+  probeDesktopShell,
+  probeWatcherAlive,
+  readLogTail,
+  readPlanResult,
+  sameBoot,
+  spawnWatcher,
+  watcherLogPath,
+  writePlan,
+} from './restart.mjs'
 import { runDesktop } from '../ui/desktop.mjs'
 
 /** 本插件会用来控制 DSH 的宿主服务，以及每一项缺席意味着什么。 */
@@ -215,6 +228,22 @@ async function attempt(label, warnings, fn) {
  */
 export function adapter(ctx, config, deps = {}) {
   const desktop = typeof deps.runDesktop === 'function' ? deps.runDesktop : runDesktop
+  // 重启这件事的副作用入口全部可替换：真机上它们会真的问 Windows、真的起进程、真的请求退出，
+  // 而测试必须能在不碰这台机器的前提下走完同一条代码路径。
+  const probeShell = typeof deps.probeShell === 'function' ? deps.probeShell : probeDesktopShell
+  const startWatcher = typeof deps.startWatcher === 'function' ? deps.startWatcher : spawnWatcher
+  const watcherAlive = typeof deps.watcherAlive === 'function' ? deps.watcherAlive : probeWatcherAlive
+  const loadPlan = typeof deps.readPlan === 'function' ? deps.readPlan : readPlanResult
+  const savePlan = typeof deps.writePlan === 'function' ? deps.writePlan : writePlan
+  const later = typeof deps.later === 'function' ? deps.later : (fn, ms) => setTimeout(fn, ms)
+  const clock = typeof deps.now === 'function' ? deps.now : () => Date.now()
+  const requestExit = typeof deps.requestExit === 'function'
+    ? deps.requestExit
+    : (code) => {
+      const exit = get(ctx, 'appExit')
+      if (typeof exit !== 'function') throw new Error('宿主没有提供 ctx.appExit')
+      return exit(code)
+    }
   const logsBySession = () => new Map(listSessionLogs().map((entry) => [entry.sessionId, entry]))
 
   /** 这条会话日志的磁盘事实；找不到日志时返回 null。 */
@@ -796,6 +825,357 @@ export function adapter(ctx, config, deps = {}) {
         waitedMs: Date.now() - started,
         reason: settled,
         warnings,
+      }
+    },
+
+    /**
+     * 现在真的在跑的会话。
+     *
+     * 「在跑」取宿主自己的口径（`sessionController.list()` 的 `running`），不是磁盘回溯：
+     * 磁盘上「回合没闭合」也可能是上次崩溃留下的，拿它去停止或恢复会认错人。走磁盘回退时
+     * 结果里带 `staleRisk: true`，把这件事说出来而不是假装一样准。
+     * @param {object} args - `{ limit }`。
+     * @returns {Promise<object>} `{ rows, scanned, source, staleRisk, warnings }`。
+     */
+    async listRunningSessions() {
+      const warnings = []
+      // 500 是 `listSessions` 自己的列取上限（`filterAndSort` 里钉死的）。正在跑的会话每一步都在写日志，
+      // 按最近活动排序时排在最前面；但「撞到上限」这件事必须说出来——悄悄少停一条会话，
+      // 比明确报一条警告糟得多。
+      const SCAN_LIMIT = 500
+      const rows = await this.listSessions({ workspace: 'all', limit: SCAN_LIMIT }, warnings)
+      const running = rows.filter((row) => row.running === true)
+      const source = rows[0]?.source ?? 'none'
+      const truncated = rows.length >= SCAN_LIMIT
+      if (truncated) warnings.push(`会话列取到 ${SCAN_LIMIT} 条就是上限了：可能有正在跑的会话没进扫描范围`)
+      return { rows: running, scanned: rows.length, source, staleRisk: source === 'disk:sessions', truncated, warnings }
+    },
+
+    /**
+     * 立即中止所有正在跑的回合——**除了调用者自己那条**。
+     *
+     * 为什么排除调用者：`pause-all` 十有八九是某个 agent 在它自己那一轮里调的，而
+     * `agent.cancel()` 会把这一轮一起中止，工具结果就再也送不回去了。所以调用者的那一轮
+     * 留在 `deferred` 里，由调用方决定（`restartHost` 会在请求退出的那一刻收掉它）。
+     * @param {object} args - `{ keepInbox, callerSessionId, limit }`。
+     * @returns {Promise<object>} `{ requested, cancelled, failed, deferred, warnings }`。
+     */
+    async pauseAll(args = {}) {
+      const snapshot = await this.listRunningSessions()
+      const callerSessionId = typeof args.callerSessionId === 'string' && args.callerSessionId !== '' ? args.callerSessionId : null
+      const cancelled = []
+      const failed = []
+      const deferred = []
+
+      for (const row of snapshot.rows) {
+        const entry = { sessionId: row.sessionId, title: row.title ?? null, workspace: row.workspace ?? null }
+        if (callerSessionId !== null && row.sessionId === callerSessionId) {
+          deferred.push({ ...entry, reason: '这是发起调用的那条会话：中止它会把本次工具结果一起带走' })
+          continue
+        }
+        try {
+          const result = await this.abortSession({ sessionId: row.sessionId, keepInbox: args.keepInbox === true })
+          cancelled.push({ ...entry, status: result.status ?? null })
+        } catch (error) {
+          failed.push({ ...entry, error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+
+      return {
+        transport: 'api',
+        requested: snapshot.rows.length,
+        cancelled,
+        failed,
+        deferred,
+        keepInbox: args.keepInbox === true,
+        source: snapshot.source,
+        staleRisk: snapshot.staleRisk,
+        warnings: snapshot.warnings,
+      }
+    },
+
+    /**
+     * 停止所有在跑的会话 → 落盘恢复计划 → 起分离看门狗 → 延迟请求退出。
+     *
+     * 顺序是刻意的，每一步都为了「退出去还回得来」：
+     *   - 先证明桌面壳找得到（`probeShell`），否则直接拒绝，绝不先退出去再说；
+     *   - 再快照「谁在跑」，因为重启后要靠这份名单继续它们；
+     *   - 计划**先落盘**：退出之后没有任何代码能补写；
+     *   - 看门狗**先起来**：它起不来就不请求退出（宁可重启不发生，也不要退出去回不来）；
+     *   - 退出是**延迟**的，否则本次工具结果会跟着这一轮一起消失。
+     *
+     * 调用者自己那条会话不在立即停止之列，而是在退出前一刻收掉（见 `pauseAll`）。
+     * @param {object} args - `{ keepInbox, text, delaySeconds, dryRun, sessionIds, callerSessionId, reason }`。
+     * @returns {Promise<object>} 计划与证据；`dryRun: true` 时只快照、不碰任何状态。
+     */
+    async restartHost(args = {}) {
+      const warnings = []
+      const nowMs = clock()
+      const dryRun = args.dryRun === true
+      const keepInbox = args.keepInbox ?? config.restart.keepInbox
+
+      // 1. 先证伪：找不到壳、或没有退出入口，就什么都不做。
+      const shell = await probeShell()
+      if (shell?.ok !== true) {
+        throw new Error(`看不到可以重新拉起的桌面壳：${shell?.reason ?? '壳探测没有返回结果'}。headless 的 dsh 请自己重启进程，插件不猜。`)
+      }
+      if (dryRun !== true && get(ctx, 'appExit') === undefined) {
+        throw new Error('宿主没有提供 ctx.appExit —— 没有请求退出的入口（托盘菜单「重启应用与 Host」是产品自己的那条路）')
+      }
+
+      // 2. 快照：重启后要继续的就是这份名单。
+      const snapshot = await this.listRunningSessions()
+      const byId = new Map(snapshot.rows.map((row) => [row.sessionId, row]))
+      const plannedIds = Array.isArray(args.sessionIds) && args.sessionIds.length > 0
+        ? args.sessionIds.filter((id) => typeof id === 'string' && id !== '')
+        : snapshot.rows.map((row) => row.sessionId)
+      const sessions = plannedIds.map((sessionId) => ({
+        sessionId,
+        title: byId.get(sessionId)?.title ?? null,
+        workspace: byId.get(sessionId)?.workspace ?? null,
+        wasRunning: byId.has(sessionId),
+      }))
+
+      const callerSessionId = typeof args.callerSessionId === 'string' && args.callerSessionId !== '' ? args.callerSessionId : null
+      const delaySeconds = Number.isFinite(args.delaySeconds) && args.delaySeconds > 0 ? args.delaySeconds : config.restart.delaySeconds
+      const resumeText = typeof args.text === 'string' && args.text.trim() !== '' ? args.text : config.restart.resumeText
+
+      const plan = {
+        version: PLAN_VERSION,
+        id: `restart-${randomUUID()}`,
+        createdAt: new Date(nowMs).toISOString(),
+        createdAtMs: nowMs,
+        state: dryRun ? 'dry-run' : 'armed',
+        reason: typeof args.reason === 'string' && args.reason !== '' ? args.reason : 'dsh_host {action:"restart"}',
+        writer: hostIdentity(),
+        shell: { mainPid: shell.mainPid, exe: shell.exe, commandLine: shell.commandLine ?? null, evidence: shell.evidence ?? null },
+        stop: { keepInbox, requested: snapshot.rows.length, cancelled: [], failed: [], deferred: [] },
+        resume: { text: resumeText, max: config.restart.maxResume },
+        sessions,
+        outcomes: [],
+        resumedAt: null,
+        resumedBy: null,
+      }
+
+      if (dryRun) {
+        return {
+          transport: 'api',
+          dryRun: true,
+          planPath: planPath(),
+          shell: plan.shell,
+          wouldStop: snapshot.rows.map((row) => ({ sessionId: row.sessionId, title: row.title ?? null })),
+          wouldResume: sessions,
+          resumeText,
+          delaySeconds,
+          warnings: [...warnings, ...snapshot.warnings],
+        }
+      }
+
+      // 3. 立即停止（调用者除外）。
+      const stopped = await this.pauseAll({ keepInbox, callerSessionId })
+      plan.stop.cancelled = stopped.cancelled
+      plan.stop.failed = stopped.failed
+      plan.stop.deferred = stopped.deferred
+      plan.stop.source = stopped.source
+      warnings.push(...stopped.warnings)
+
+      // 4. 计划落盘：退出之后没人能补写。
+      savePlan(plan)
+
+      // 5. 看门狗：起不来就绝不请求退出。
+      let watcher
+      try {
+        watcher = await startWatcher({
+          mainPid: shell.mainPid,
+          exe: shell.exe,
+          timeoutSeconds: config.restart.watcherTimeoutSeconds,
+          settleMs: config.restart.settleMs,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        plan.state = 'failed'
+        plan.failure = `看门狗起不来：${message}`
+        savePlan(plan)
+        throw new Error(`看门狗起不来，已取消退出（会话已经停了，但 DSH 还在跑）：${message}`)
+      }
+      // `method` 是证据的一部分：`wmi` = 新进程挂在 WmiPrvSE 下、不在 DSH 的进程树里；
+      // `detached` = 只是分离的子进程（壳若用 kill-on-close 的 Job Object，它会跟着走）。
+      plan.watcher = {
+        pid: watcher.pid ?? null,
+        method: watcher.method ?? null,
+        shell: watcher.shell ?? null,
+        logPath: watcher.logPath,
+        script: watcher.script,
+        attempts: watcher.attempts ?? [],
+      }
+      savePlan(plan)
+
+      // 6. 延迟退出：先让本次工具结果送达，再收掉调用者那一轮，最后退出。
+      const delayMs = Math.max(1, delaySeconds) * 1000
+      plan.exit = { delaySeconds, scheduledAt: new Date(clock()).toISOString() }
+      savePlan(plan)
+      later(() => {
+        void (async () => {
+          if (callerSessionId !== null) {
+            try { await this.abortSession({ sessionId: callerSessionId, keepInbox }) } catch { /* 退出在即，收不掉也照样退 */ }
+          }
+          // 最后一道闸：看门狗在这几秒里死了的话，退出就等于把 DSH 关掉且没人拉起来。
+          if (Number.isFinite(watcher.pid)) {
+            const alive = await watcherAlive(watcher.pid)
+            if (alive === false) {
+              plan.state = 'failed'
+              plan.failure = `退出前发现看门狗（pid ${watcher.pid}）已经不在了，取消退出`
+              try { savePlan(plan) } catch { /* 写不动就只剩日志 */ }
+              return
+            }
+          }
+          try {
+            requestExit(0)
+          } catch (error) {
+            plan.state = 'failed'
+            plan.failure = `请求退出失败：${error instanceof Error ? error.message : String(error)}`
+            try { savePlan(plan) } catch { /* 写不动就只剩日志 */ }
+          }
+        })()
+      }, delayMs)
+
+      return {
+        transport: 'api',
+        restartId: plan.id,
+        planPath: planPath(),
+        shell: plan.shell,
+        watcher: plan.watcher,
+        stopped: { requested: plan.stop.requested, cancelled: plan.stop.cancelled.length, failed: plan.stop.failed.length, deferred: plan.stop.deferred.length, detail: plan.stop },
+        willResume: sessions,
+        resumeText,
+        exitInSeconds: delaySeconds,
+        note: `这个进程会在约 ${delaySeconds} 秒后退出，看门狗等它退出后重新拉起应用；重启后插件按计划把这些会话继续起来。`,
+        warnings,
+      }
+    },
+
+    /**
+     * 上次重启计划的状态、看门狗日志，以及「这份计划是不是当前这个进程写的」。
+     * @returns {Promise<object>} 状态；没有计划时说清楚没有，而不是编一个。
+     */
+    async restartStatus() {
+      const { plan, path, error } = loadPlan()
+      const watcherLog = readLogTail(watcherLogPath(), 12)
+      const current = hostIdentity()
+      if (plan === null) {
+        return { transport: 'disk', planPath: path, plan: null, planError: error, watcherLog, currentHost: current, note: '没有重启计划：这个进程不是被 dsh_host 重启起来的（或计划已被清掉）' }
+      }
+      const ageSeconds = Math.round((clock() - (plan.createdAtMs ?? 0)) / 1000)
+      return {
+        transport: 'disk',
+        planPath: path,
+        plan: {
+          id: plan.id ?? null,
+          state: plan.state ?? null,
+          createdAt: plan.createdAt ?? null,
+          ageSeconds,
+          reason: plan.reason ?? null,
+          shell: plan.shell ?? null,
+          watcher: plan.watcher ?? null,
+          exit: plan.exit ?? null,
+          stop: {
+            requested: plan.stop?.requested ?? 0,
+            cancelled: plan.stop?.cancelled?.length ?? 0,
+            failed: plan.stop?.failed?.length ?? 0,
+            deferred: plan.stop?.deferred ?? [],
+          },
+          resume: plan.resume ?? null,
+          sessions: plan.sessions ?? [],
+          outcomes: plan.outcomes ?? [],
+          resumedAt: plan.resumedAt ?? null,
+          failure: plan.failure ?? null,
+        },
+        belongsToCurrentBoot: sameBoot(plan.writer, current),
+        watcherLog,
+        currentHost: current,
+      }
+    },
+
+    /**
+     * 重启后的恢复腿：按计划把重启前在跑的会话重新驱动起来。
+     *
+     * 只有「计划是**别的**进程写的」才会真的投递：同一个进程里的插件重载不该把消息再投一遍。
+     * 投递前先把状态改成 `claimed` 落盘，所以即使中途崩了也不会重复投递。
+     * @param {object} args - `{ sessionIds, text, max, force }`。
+     * @returns {Promise<object>} 恢复结果；服务还没起来时返回 `state: "services-not-ready"` 让调用方重试。
+     */
+    async resumeAfterRestart(args = {}) {
+      const current = hostIdentity()
+      const { plan, path, error } = loadPlan()
+      if (plan === null) return { transport: 'disk', state: 'no-plan', planPath: path, planError: error, currentHost: current }
+
+      if (args.force !== true && sameBoot(plan.writer, current)) {
+        return { transport: 'disk', state: 'same-boot', planPath: path, planState: plan.state ?? null, currentHost: current, reason: '这份计划是当前这个进程写的：退出还没发生（或插件被重载），不重复恢复；要强制执行用 force:true' }
+      }
+      if (plan.state === 'done') return { transport: 'disk', state: 'already-done', planPath: path, outcomes: plan.outcomes ?? [], resumedAt: plan.resumedAt ?? null }
+      if (plan.state === 'expired') return { transport: 'disk', state: 'expired', planPath: path, failure: plan.failure ?? null }
+      if (plan.state !== 'armed' && plan.state !== 'claimed') {
+        return { transport: 'disk', state: plan.state ?? 'unknown', planPath: path, failure: plan.failure ?? null, reason: `计划状态是 ${plan.state ?? '未知'}，不再恢复` }
+      }
+
+      const ageSeconds = (clock() - (plan.createdAtMs ?? 0)) / 1000
+      if (ageSeconds > config.restart.planTtlSeconds) {
+        plan.state = 'expired'
+        plan.failure = `计划已过期：${Math.round(ageSeconds)}s > ${config.restart.planTtlSeconds}s`
+        savePlan(plan)
+        return { transport: 'disk', state: 'expired', planPath: path, ageSeconds: Math.round(ageSeconds), failure: plan.failure }
+      }
+
+      const controller = get(ctx, 'sessionController')
+      if (typeof controller?.resolveAgent !== 'function') {
+        return { transport: 'api', state: 'services-not-ready', planPath: path, reason: 'sessionController.resolveAgent 还没上线', retryable: true }
+      }
+
+      const planned = Array.isArray(plan.sessions) ? plan.sessions : []
+      const requested = Array.isArray(args.sessionIds) && args.sessionIds.length > 0
+        ? args.sessionIds.filter((id) => typeof id === 'string' && id !== '')
+        : planned.map((entry) => entry.sessionId)
+      const max = Number.isFinite(args.max) && args.max > 0 ? Math.round(args.max) : config.restart.maxResume
+      const targets = requested.slice(0, max)
+      const skipped = requested.slice(max)
+      const text = typeof args.text === 'string' && args.text.trim() !== '' ? args.text : plan.resume?.text ?? config.restart.resumeText
+
+      // 先记账再投递：投到一半崩了，重启也不该把已投的再投一遍。
+      plan.state = 'claimed'
+      plan.claimedAt = new Date(clock()).toISOString()
+      plan.claimedBy = current
+      savePlan(plan)
+
+      const outcomes = []
+      for (const sessionId of targets) {
+        try {
+          const result = await this.sendToSession({ sessionId, text, mode: 'followup' })
+          outcomes.push({ sessionId, ok: true, transport: result.transport, flushed: result.flushed ?? null })
+        } catch (error) {
+          outcomes.push({ sessionId, ok: false, error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+
+      const resumed = outcomes.filter((outcome) => outcome.ok).length
+      const failed = outcomes.filter((outcome) => outcome.ok !== true)
+      plan.outcomes = outcomes
+      plan.resumedAt = new Date(clock()).toISOString()
+      plan.resumedBy = current
+      plan.state = failed.length === 0 ? 'done' : resumed === 0 ? 'failed' : 'partial'
+      savePlan(plan)
+
+      return {
+        transport: 'api',
+        state: plan.state,
+        planPath: path,
+        resumed,
+        failed: failed.length,
+        outcomes,
+        requested: requested.length,
+        skipped,
+        text,
+        currentHost: current,
+        warnings: [],
       }
     },
 
