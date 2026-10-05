@@ -29,7 +29,7 @@ export const PLUGIN_ROOT = resolvePath(HERE, '..', '..')
 export const DESKTOP_SCRIPT = join(HERE, 'desktop.ps1')
 
 /** 回退动作名，和脚本里的 `-Action` 取值一一对应。 */
-export const UI_ACTIONS = ['window', 'look', 'click', 'type', 'key', 'scroll']
+export const UI_ACTIONS = ['window', 'look', 'click', 'type', 'key', 'scroll', 'new-session']
 
 /** PowerShell 可执行文件：先 pwsh（7+），再 Windows PowerShell 5.1。 */
 const POWERSHELL_CANDIDATES = ['pwsh.exe', 'powershell.exe']
@@ -55,6 +55,20 @@ function scriptArgs(action, args, config, screenshotPath) {
   if (action === 'click') list.push('-X', String(Math.round(args.x)), '-Y', String(Math.round(args.y)))
   if (action === 'type') list.push('-Text', String(args.text))
   if (action === 'key') list.push('-Chord', String(args.chord))
+  if (action === 'new-session') {
+    // The message travels as base64 so the text never has to survive a command line: a BOM, a
+    // quote or a `%` in the prompt would otherwise be the difference between typing it and
+    // typing something else. `-TextIsBase64` tells the script to decode it back to UTF-8.
+    if (Number.isFinite(args.newSessionX)) list.push('-NewSessionX', String(args.newSessionX))
+    if (Number.isFinite(args.newSessionY)) list.push('-NewSessionY', String(args.newSessionY))
+    if (Number.isFinite(args.composerX)) list.push('-ComposerX', String(args.composerX))
+    if (Number.isFinite(args.composerY)) list.push('-ComposerY', String(args.composerY))
+    if (Number.isFinite(args.settleMs)) list.push('-SettleMs', String(Math.round(args.settleMs)))
+    if (args.submit === true) list.push('-Submit')
+    if (typeof args.text === 'string' && args.text !== '') {
+      list.push('-TextIsBase64', '-Text', Buffer.from(args.text, 'utf8').toString('base64'))
+    }
+  }
   if (action === 'scroll') {
     list.push('-Notches', String(Math.round(args.notches)))
     if (Number.isFinite(args.x)) list.push('-X', String(Math.round(args.x)))
@@ -76,7 +90,11 @@ export async function runDesktop(action, args, config, options = {}) {
   if (!existsSync(DESKTOP_SCRIPT)) {
     throw new Error(`dsh-controller: 找不到 UI 回退脚本 ${DESKTOP_SCRIPT}`)
   }
-  const timeoutMs = options.timeoutMs ?? config.ui.scriptTimeoutMs
+  const base = options.timeoutMs ?? config.ui.scriptTimeoutMs
+  // A step of `new-session` types the message one character at a time (12ms each) and waits out
+  // the shell twice, so the flat script timeout would kill a long first message mid-sentence.
+  const typing = action === 'new-session' && typeof args.text === 'string' ? args.text.length * 20 + 4000 : 0
+  const timeoutMs = base + typing
   const cliArgs = ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', DESKTOP_SCRIPT, ...scriptArgs(action, args, config, options.screenshotPath)]
 
   let lastError = null

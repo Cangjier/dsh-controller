@@ -136,6 +136,16 @@ test('waitIdle 对已经空闲的会话立刻返回', async () => {
   assert.equal(result.state, 'IDLE')
 })
 
+/** 一个假的桌面通道：把 `runDesktop` 的调用记下来，按脚本返回预置结果。 */
+function fakeDesktop(script) {
+  const calls = []
+  const run = async (action, args) => {
+    calls.push({ action, args })
+    return script(action, args, calls.length)
+  }
+  return { run, calls }
+}
+
 test('createSession 用 sessionController.create + resolveAgent + followup', async () => {
   const agent = fakeAgent({ id: 'session-new' })
   const created = []
@@ -147,7 +157,7 @@ test('createSession 用 sessionController.create + resolveAgent + followup', asy
     sessions: { flush: async () => true },
   }), normalizeConfig(undefined))
 
-  const result = await host.createSession({ text: '开工', cwd: 'C:\\work' })
+  const result = await host.createSession({ text: '开工', cwd: 'C:\\work', via: 'api' })
   assert.equal(result.transport, 'api')
   assert.equal(result.sessionId, 'session-new')
   assert.equal(created[0].cwd, 'C:\\work')
@@ -155,9 +165,117 @@ test('createSession 用 sessionController.create + resolveAgent + followup', asy
   assert.equal(agent.followupCalls[0].content[0].text, '开工')
 })
 
-test('createSession 在没有会话服务时拒绝，而不是偷偷去点 GUI', async () => {
+test('createSessionViaApi 在没有会话服务时拒绝，而不是偷偷去点 GUI', async () => {
   const host = adapter(contextWith({}), normalizeConfig(undefined))
-  await assert.rejects(() => host.createSession({ text: 'x', cwd: 'C:\\w' }), /无法新建会话/)
+  await assert.rejects(() => host.createSessionViaApi({ text: 'x', cwd: 'C:\\w' }), /无法新建会话/)
+})
+
+test('createSession 默认先试 GUI，GUI 失败才退回 API，并把原因写进 fallback', async () => {
+  const agent = fakeAgent({ id: 'session-api' })
+  const desktop = fakeDesktop(() => ({ ok: false, reason: 'window-not-found' }))
+  const host = adapter(contextWith({
+    sessionController: {
+      create: async () => ({ sessionId: 'session-api' }),
+      resolveAgent: async () => ({ agent }),
+    },
+  }), normalizeConfig(undefined), { runDesktop: desktop.run })
+
+  const result = await host.createSession({ text: '开工', cwd: 'C:\\work', via: 'auto' })
+  assert.equal(result.transport, 'api', 'GUI 不可用时必须落到 API')
+  assert.equal(result.sessionId, 'session-api')
+  assert.equal(result.fallback.from, 'ui')
+  assert.match(result.fallback.reason, /找不到可操作的 DSH 窗口/)
+  assert.ok(result.warnings.some((warning) => warning.includes('GUI 新建会话失败，已退回 API')))
+  assert.equal(agent.followupCalls.length, 1)
+  assert.equal(desktop.calls[0].action, 'window', 'GUI 路的第一步是找窗口，不是瞎点')
+})
+
+test('createSession 的 GUI 路成功时一个 API 建会话都不调，会话来自列表差', async () => {
+  const followups = []
+  const agent = { id: 'gui-created', session: { id: 'gui-created' }, status: 'idle', followup: (message) => followups.push(message) }
+  let listed = 0
+  const desktop = fakeDesktop((action) => {
+    if (action === 'window') return { ok: true, target: { handle: 1, title: 'DeepSeek Harness' } }
+    return { ok: true, clicked: true, submitted: true, method: 'sendinput-unicode', sentChars: 3, pointerRestored: true }
+  })
+  const host = adapter(contextWith({
+    sessionController: {
+      // 只有列表和投递可用；`create` 一旦被调用就说明路由错了。
+      list: async () => {
+        listed += 1
+        return listed === 1
+          ? [{ sessionId: 'old', running: false, blank: false, cwd: 'C:\\w', updatedAt: 1 }]
+          : [{ sessionId: 'gui-created', running: true, blank: true, cwd: 'C:\\w', updatedAt: 99 }, { sessionId: 'old', running: false, blank: false, cwd: 'C:\\w', updatedAt: 1 }]
+      },
+      create: async () => { throw new Error('GUI 成功时不该再调 sessionController.create') },
+      resolveAgent: async () => ({ agent }),
+    },
+    sessions: { flush: async () => true },
+  }), normalizeConfig({ create: { waitMs: 4000, submitInGui: true } }), { runDesktop: desktop.run })
+
+  const result = await host.createSession({ text: '你好', via: 'auto' })
+  assert.equal(result.transport, 'ui')
+  assert.equal(result.sessionId, 'gui-created', '认领的是点之前不存在的那条会话')
+  assert.equal(result.detectedBy, 'list-diff')
+  assert.equal(result.firstMessage, 'ui')
+  assert.equal(followups.length, 0, '消息已经在 GUI 里发出去了，不该再投一遍')
+  assert.deepEqual(desktop.calls.map((call) => call.action), ['window', 'new-session', 'new-session'])
+})
+
+test('GUI 建出了会话但第一条消息没送进去时，改由 API 投递而不是留下空会话', async () => {
+  const followups = []
+  const agent = { id: 'gui-created', session: { id: 'gui-created' }, status: 'idle', followup: (message) => followups.push(message) }
+  let listed = 0
+  const desktop = fakeDesktop((action, args, callIndex) => {
+    if (action === 'window') return { ok: true, target: { handle: 1 } }
+    if (callIndex === 2) return { ok: true, clicked: true } // 只是点开，不带 submit
+    return { ok: false, reason: 'text-not-delivered', sentChars: 0 }
+  })
+  const host = adapter(contextWith({
+    sessionController: {
+      list: async () => {
+        listed += 1
+        return listed === 1 ? [] : [{ sessionId: 'gui-created', running: false, blank: true, cwd: 'C:\\w', updatedAt: 50 }]
+      },
+      resolveAgent: async () => ({ agent }),
+    },
+    sessions: { flush: async () => true },
+  }), normalizeConfig({ create: { waitMs: 4000, submitInGui: true } }), { runDesktop: desktop.run })
+
+  const result = await host.createSession({ text: '你好', via: 'auto' })
+  assert.equal(result.transport, 'ui')
+  assert.equal(result.firstMessage, 'api')
+  assert.equal(followups.length, 1)
+  assert.equal(followups[0].content[0].text, '你好')
+  assert.ok(result.warnings.some((warning) => warning.includes('GUI 送字失败')))
+})
+
+test('createSession 在 via:"api" 时完全不碰 GUI', async () => {
+  const agent = fakeAgent({ id: 'session-api' })
+  const desktop = fakeDesktop(() => { throw new Error('via:"api" 不该碰桌面通道') })
+  const host = adapter(contextWith({
+    sessionController: {
+      create: async () => ({ sessionId: 'session-api' }),
+      resolveAgent: async () => ({ agent }),
+    },
+  }), normalizeConfig(undefined), { runDesktop: desktop.run })
+
+  const result = await host.createSession({ text: '开工', via: 'api' })
+  assert.equal(result.transport, 'api')
+  assert.equal(result.fallback, undefined, 'via:"api" 不该留下回退痕迹')
+  assert.equal(desktop.calls.length, 0)
+})
+
+test('createSession 在 via:"gui" 时宁可失败也不偷偷用 API', async () => {
+  const desktop = fakeDesktop(() => ({ ok: false, reason: 'window-not-found' }))
+  const host = adapter(contextWith({
+    sessionController: {
+      create: async () => { throw new Error('via:"gui" 不该回退到 API') },
+      resolveAgent: async () => ({ agent: fakeAgent({ id: 'session-api' }) }),
+    },
+  }), normalizeConfig(undefined), { runDesktop: desktop.run })
+
+  await assert.rejects(() => host.createSession({ text: 'x', via: 'gui' }), /禁止回退到 API/)
 })
 
 test('pluginAction 在没有 pluginManager 时拒绝，并说明原因', async () => {

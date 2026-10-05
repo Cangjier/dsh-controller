@@ -1,9 +1,10 @@
 /**
- * 宿主适配层：**先 DSH 自己的 API，读不到才退回磁盘**。
+ * 宿主适配层：**读和控制先走 DSH 自己的 API，读不到才退回磁盘**；唯一例外是
+ * `createSession()`——它默认先点真实窗口里的「新会话」，失败再整条退回 API。
  *
  * 这一层存在的理由只有一个：把「这次用的是哪条路」变成结果里的一个字段。所以每个方法都返回
- * `source`，并且在 API 调用失败时把原因放进 `warnings`——**不抛错、不静默降级**。一个插件
- * 对宿主内部的猜测错了，应该表现为一条可读的警告，而不是一次异常的失败或者一次假成功。
+ * `source` 或 `transport`，并且在 API 调用失败时把原因放进 `warnings`——**不抛错、不静默降级**。
+ * 一个插件对宿主内部的猜测错了，应该表现为一条可读的警告，而不是一次异常的失败或者一次假成功。
  *
  * 探测出来的服务清单在 `API_SERVICES`：每一项都是 `ctx.get(name)` 的真实结果，缺失时说明
  * 是哪一层没装配。判定依据来自 DSH 0.2.0-rc.2 的包源码（`dsh-client-*` 与各服务的 README），
@@ -16,6 +17,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { dshHome, profileDir, profileName } from './paths.mjs'
 import { listSessionLogs, readLog, readProjection, summarizeFromDisk } from './sessionlog.mjs'
+import { runDesktop } from '../ui/desktop.mjs'
 
 /** 本插件会用来控制 DSH 的宿主服务，以及每一项缺席意味着什么。 */
 export const API_SERVICES = [
@@ -208,9 +210,11 @@ async function attempt(label, warnings, fn) {
  * 因为 cordis 树可以在运行期变化（插件被禁用/启用），缓存服务引用会读到过期的实例。
  * @param {object} ctx - cordis 上下文。
  * @param {object} config - 归一化后的插件配置。
+ * @param {object} [deps] - 可替换的副作用入口；目前只有 `runDesktop`，测试用它避免真的去点窗口。
  * @returns {object} 适配器。
  */
-export function adapter(ctx, config) {
+export function adapter(ctx, config, deps = {}) {
+  const desktop = typeof deps.runDesktop === 'function' ? deps.runDesktop : runDesktop
   const logsBySession = () => new Map(listSessionLogs().map((entry) => [entry.sessionId, entry]))
 
   /** 这条会话日志的磁盘事实；找不到日志时返回 null。 */
@@ -454,14 +458,210 @@ export function adapter(ctx, config) {
     },
 
     /**
-     * 新建会话并投第一条消息。
+     * 新建会话并投第一条消息——**路由**：先 GUI，失败退 API。
      *
-     * 走 `sessionController.create()`（产品自己的路径）+ `resolveAgent().agent.followup()`；
-     * 服务缺席时退回 `agents.create()`（`dsh-mail-notify` 用的就是后者）。
-     * @param {object} args - `{ text, cwd, title, preset, provider, model }`。
-     * @returns {Promise<object>} 结果。
+     * 为什么 GUI 能排在前面而不是「只留给只有 GUI 才有的事」：DSH 桌面壳的「新会话」按钮
+     * 走的是产品自己的建会话路径（点它等于人点了它），所以这条路造出来的会话和 API 造的
+     * 是同一种东西，而不是一个冒牌货。代价是它需要有人看得见的窗口，并且会把窗口抢到前台。
+     *
+     * 两条路都是**全有或全无**：GUI 半路失败（窗口不在前台、会话没出现在列表里、第一条消息
+     * 没送进去）就整条退掉，绝不出现「GUI 建了一半 + API 再建一条」的两条对话。
+     * @param {object} args - `{ text, cwd, title, preset, via }`。
+     * @returns {Promise<object>} 结果，带 `transport: "ui" | "api"` 与 `fallback` 说明。
      */
     async createSession(args) {
+      const via = args.via ?? config.create.via
+      if (via === 'api') return this.createSessionViaApi(args)
+
+      const warnings = []
+      const gui = await this.createSessionViaGui(args, warnings)
+      if (gui.ok === true) return { ...gui, warnings: [...warnings, ...(gui.warnings ?? [])] }
+
+      if (via === 'gui') {
+        throw new Error(`GUI 新建会话失败（已按 config.create.via="gui" 禁止回退到 API）：${gui.reason}`)
+      }
+      const viaApi = await this.createSessionViaApi(args)
+      return {
+        ...viaApi,
+        fallback: { from: 'ui', reason: gui.reason, guiEvidence: gui.evidence ?? null },
+        warnings: [...warnings, `GUI 新建会话失败，已退回 API：${gui.reason}`, ...(viaApi.warnings ?? [])],
+      }
+    },
+
+    /**
+     * GUI 路：点 DSH 自己的「新会话」，等它出现在会话列表里，再把第一条消息送进输入框。
+     *
+     * 检测用的是**集合差**（点之前有哪些会话 id，点之后多了哪一个），不是「找一条空会话」：
+     * 列表里有历史遗留的空会话是常态，靠 `blank` 认领会认错人。检测走 `listSessions`，
+     * 所以列表本身不可用时这条路直接失败并说明原因——而不是假装成功。
+     * @param {object} args - `{ text, cwd, title, preset }`。
+     * @param {string[]} warnings - 警告收集器。
+     * @returns {Promise<object>} `{ ok, reason, evidence, sessionId? }`。
+     */
+    async createSessionViaGui(args, warnings) {
+      if (process.platform !== 'win32') {
+        return { ok: false, reason: `桌面通道只在 Windows 上可用（当前平台 ${process.platform}）` }
+      }
+      const window = await attempt('ui.window', warnings, () => desktop('window', {}, config, { timeoutMs: 20_000 }))
+      if (window === null || window?.ok !== true || window?.target === undefined) {
+        return { ok: false, reason: `找不到可操作的 DSH 窗口（${window?.reason ?? 'window 动作没有返回目标'}）`, evidence: { window } }
+      }
+
+      const before = await attempt('listSessions(before)', warnings, () => this.listSessions({ workspace: 'all', limit: 500 }))
+      if (!Array.isArray(before)) {
+        return { ok: false, reason: '会话列表读不出来，无法确认 GUI 是否真的建了会话' }
+      }
+      const known = new Set(before.map((row) => row.sessionId))
+
+      const click = await attempt('ui.new-session', warnings, () => desktop('new-session', {
+        newSessionX: config.create.newSessionX,
+        newSessionY: config.create.newSessionY,
+        settleMs: config.create.settleMs,
+      }, config, { timeoutMs: config.create.clickTimeoutMs }))
+      if (click === null || click?.ok !== true) {
+        return { ok: false, reason: `点击「新会话」失败：${click?.reason ?? '脚本没有返回结果'}`, evidence: { click } }
+      }
+
+      const detected = await this.waitForNewSession(known, config.create.waitMs, warnings)
+      if (detected === null) {
+        return {
+          ok: false,
+          reason: `点了「新会话」，但 ${config.create.waitMs}ms 内没有新会话出现在列表里`,
+          evidence: { click, sessionsBefore: before.length },
+        }
+      }
+
+      // 会话已经在屏幕上了。第一条消息仍然按 `submitInGui` 决定走哪条路：GUI 送字依赖
+      // 真实键盘注入，送不进去就交给 API，而不是把一条空会话留给用户。
+      const warningsFromApi = []
+      let submitted = { transport: 'api', delivered: false }
+      if (config.create.submitInGui) {
+        const type = await attempt('ui.new-session(submit)', warningsFromApi, () => desktop('new-session', {
+          newSessionX: config.create.newSessionX,
+          newSessionY: config.create.newSessionY,
+          composerX: config.create.composerX,
+          composerY: config.create.composerY,
+          settleMs: config.create.settleMs,
+          text: args.text,
+          submit: true,
+        }, config, { timeoutMs: config.create.clickTimeoutMs + args.text.length * 20 + 4000 }))
+        if (type?.ok === true && type?.submitted === true) submitted = { transport: 'ui', delivered: true, method: type.method, sentChars: type.sentChars }
+        else warningsFromApi.push(`GUI 送字失败，已改用 API 投递第一条消息：${type?.reason ?? '脚本没有返回结果'}`)
+      }
+      if (submitted.delivered !== true) {
+        const delivered = await this.deliverFirstMessage(detected.sessionId, args.text, warningsFromApi)
+        if (delivered !== true) {
+          return {
+            ok: false,
+            reason: `会话已在 GUI 中建立（${detected.sessionId}），但第一条消息没能投递`,
+            evidence: { sessionId: detected.sessionId, click },
+          }
+        }
+        // 走到这里消息是真的投出去了，而投递的那条路是 API，不是 GUI。
+        submitted = { transport: 'api', delivered: true }
+      }
+
+      const titleResult = args.title === undefined ? null : await attempt('rename(gui-created)', warningsFromApi, () => this.renameSession({ sessionId: detected.sessionId, title: args.title }))
+      const cwdResult = args.cwd === undefined ? null : await attempt('workspaceRegistry.attach(gui-created)', warningsFromApi, async () => {
+        const workspaces = get(ctx, 'workspaceRegistry')
+        if (typeof workspaces?.create !== 'function') return null
+        const workspace = await workspaces.create(args.cwd)
+        return workspace.attachSession(detected.sessionId)
+      })
+
+      return {
+        ok: true,
+        transport: 'ui',
+        sessionId: detected.sessionId,
+        cwd: detected.cwd ?? args.cwd ?? null,
+        title: args.title ?? null,
+        firstMessage: submitted.delivered === true ? submitted.transport : 'none',
+        detectedBy: detected.detectedBy,
+        waitedMs: detected.waitedMs,
+        evidence: { click: { newSessionX: click.newSessionX, newSessionY: click.newSessionY, pointerRestored: click.pointerRestored }, sessionsBefore: before.length, title: titleResult, cwd: cwdResult },
+        warnings: warningsFromApi,
+      }
+    },
+
+    /**
+     * 等一条新会话出现在列表里。返回它，或者超时返回 null。
+     * @param {Set<string>} known - 点之前已知的会话 id。
+     * @param {number} waitMs - 上限。
+     * @param {string[]} warnings - 警告收集器。
+     * @returns {Promise<object|null>} `{ sessionId, cwd, detectedBy, waitedMs }`。
+     */
+    async waitForNewSession(known, waitMs, warnings) {
+      const started = Date.now()
+      const deadline = started + Math.max(1, waitMs)
+      let rounds = 0
+      let diskSweep = false
+      while (Date.now() < deadline) {
+        rounds += 1
+        await new Promise((resolve) => setTimeout(resolve, 250))
+        const rows = await attempt('listSessions(gui-watch)', warnings, () => this.listSessions({ workspace: 'all', limit: 500 }))
+        if (Array.isArray(rows)) {
+          const fresh = rows.filter((row) => !known.has(row.sessionId))
+          if (fresh.length > 0) {
+            // 多了不止一条就说清楚取了哪条：按最近活动排，就是刚点出来的那条。
+            const chosen = fresh[0]
+            return { sessionId: chosen.sessionId, cwd: chosen.workspace ?? null, detectedBy: 'list-diff', waitedMs: Date.now() - started, rounds, extraNewSessions: fresh.length - 1 }
+          }
+        } else if (!diskSweep) {
+          // 列表读不出来时退到磁盘事实：新会话目录会先出现在 ~/.dsh/sessions 下。
+          diskSweep = true
+          const found = await this.waitForNewSessionDirectory(known, Math.max(1000, deadline - Date.now()))
+          if (found !== null) return { ...found, detectedBy: 'disk-directory', waitedMs: Date.now() - started, rounds }
+          return null
+        }
+      }
+      return null
+    },
+
+    /**
+     * 磁盘兜底：轮询 `~/.dsh/sessions` 找一个新的会话目录。
+     * @param {Set<string>} known - 已知会话 id。
+     * @param {number} budgetMs - 还能等多久。
+     * @returns {Promise<object|null>} 找到的会话，或 null。
+     */
+    async waitForNewSessionDirectory(known, budgetMs) {
+      const deadline = Date.now() + budgetMs
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 300))
+        try {
+          const fresh = listSessionLogs().filter((entry) => !known.has(entry.sessionId))
+          if (fresh.length > 0) return { sessionId: fresh[0].sessionId, cwd: null }
+        } catch { /* 读不到就继续等 */ }
+      }
+      return null
+    },
+
+    /**
+     * 把第一条消息投进一条已经存在的会话（GUI 建出来、API 接手的那一步）。
+     * @param {string} sessionId - 目标会话。
+     * @param {string} text - 消息正文。
+     * @param {string[]} warnings - 警告收集器。
+     * @returns {Promise<boolean>} 投出去了就是 true。
+     */
+    async deliverFirstMessage(sessionId, text, warnings) {
+      const controller = get(ctx, 'sessionController')
+      const resolved = await attempt('sessionController.resolveAgent(gui-created)', warnings, () => (typeof controller?.resolveAgent === 'function' ? controller.resolveAgent(sessionId) : null))
+      const agent = resolved?.agent ?? null
+      if (agent === null || typeof agent.followup !== 'function') {
+        warnings.push(`会话 ${sessionId} 拿不到可投递的 agent`)
+        return false
+      }
+      agent.followup(userMessage(text))
+      await attempt('sessions.flush(gui-created)', warnings, () => get(ctx, 'sessions')?.flush?.(agent.session) ?? null)
+      return true
+    },
+
+    /**
+     * API 路：`sessionController.create()`（产品自己的路径）+ `resolveAgent().agent.followup()`；
+     * 服务缺席时退回 `agents.create()`（`dsh-mail-notify` 用的就是后者）。
+     * @param {object} args - `{ text, cwd, title, preset, provider, model, sessionId }`。
+     * @returns {Promise<object>} 结果。
+     */
+    async createSessionViaApi(args) {
       const warnings = []
       const controller = get(ctx, 'sessionController')
       const agents = get(ctx, 'agents')

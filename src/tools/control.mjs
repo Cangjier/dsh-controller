@@ -23,7 +23,7 @@ const ROUTES = {
   guide: { preferred: null, fallback: null, reason: '纯计算：读注册表，不碰宿主' },
   'dsh_sessions.list': { preferred: 'api', fallback: 'disk', reason: 'sessionController.list 一次给全（含 running）' },
   'dsh_sessions.get': { preferred: 'api', fallback: 'disk', reason: 'sessionQuery 读历史，live agent 读状态' },
-  'dsh_sessions.create': { preferred: 'api', fallback: null, reason: '只有 API 能建会话；没有这条路时不会去点 GUI' },
+  'dsh_sessions.create': { preferred: 'ui', fallback: 'api', reason: '默认点真实窗口的「新会话」按钮，再用 API 的会话列表确认它真的出现了；任一步失败就整条退回 sessionController.create + agents.create' },
   'dsh_sessions.send': { preferred: 'api', fallback: null, reason: 'sessionController.resolveAgent + followup，与 dsh-schedule 投递提醒同路' },
   'dsh_sessions.abort': { preferred: 'api', fallback: null, reason: 'agent.cancel 是唯一的干净中止路径' },
   'dsh_sessions.wait': { preferred: 'api', fallback: null, reason: 'agent.whenIdle' },

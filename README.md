@@ -2,15 +2,26 @@
 
 DSH 插件：**让 agent 控制 DSH 自身**。
 
-先走 DSH 自己暴露的 API（cordis 服务），走不通才退回桌面自动化。这不是一句口号，是每个工具结果里的
-`transport` 字段：`api` = 真的调了 `sessionController` / `agents` / `pluginManager`，`disk` = 只读磁盘
-事实，`ui` = 真的去点那个窗口。
+先走 DSH 自己暴露的 API（cordis 服务），走不通才退回桌面自动化。**唯一的例外是
+`dsh_sessions {action:"create"}`：它默认先点真实窗口里的「新会话」按钮，再用 API 的会话列表确认那条
+会话真的出现了，任一步失败就整条退回 API 建会话。** 这不是一句口号，是每个工具结果里的 `transport`
+字段：`api` = 真的调了 `sessionController` / `agents` / `pluginManager`，`disk` = 只读磁盘事实，
+`ui` = 真的去点那个窗口。
 
 ```jsonc
-// dsh_sessions {action:"create"} 的真实返回
-{ "transport": "api", "sessionId": "session-e47d1ae0-…", "cwd": "C:\\…\\dsh-controller",
-  "preset": "standard", "flushed": true, "warnings": [] }
+// dsh_sessions {action:"create"} 的两种真实返回
+// GUI 路成功：会话是点出来的，第一条消息由 API 投递，证据是列表差
+{ "transport": "ui", "sessionId": "session-…", "detectedBy": "list-diff", "waitedMs": 742,
+  "firstMessage": "api", "evidence": { "click": { "pointerRestored": true } } }
+// GUI 不可用：整条退回 API，并说明为什么
+{ "transport": "api", "sessionId": "session-…", "fallback": { "from": "ui",
+  "reason": "找不到可操作的 DSH 窗口（window-not-found）" } }
 ```
+
+为什么 `create` 可以反过来、而且不是碰运气：那个按钮走的就是产品自己的建会话路径，点出来的会话与
+`sessionController.create` 造的是同一种东西；关键是这条路**有证据**——「点之前有哪些会话 id」与
+「点之后有哪些」的集合差证明它真的建成了。两条路都是全有或全无，不会出现「GUI 建了一半 + API 再建
+一条」的两条对话。
 
 ## 为什么先 API
 
@@ -25,8 +36,26 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 | `sessionProjections.stateOf(session, 'goal')` | 目标处在什么阶段、第几轮 |
 | 无人值守时也能工作 | 合成输入需要窗口在前台；宿主的服务不需要 |
 
-所以 UI 只留给「确实只有 GUI 暴露」的事情，而且每一次输入前都先**确认窗口在前台**——合成输入失败是不
-报错的，前台确认是那里唯一可信的证据。
+所以 UI 只留给「确实只有 GUI 暴露」的事情（`create` 是那条例外，理由见上），而且每一次输入前都先
+**确认窗口在前台**——合成输入失败是不报错的，前台确认是那里唯一可信的证据。
+
+### 这台机器上实测出来的 GUI 边界
+
+`create` 的 GUI 腿不是「理论上应该能用」，下面每条都是量过的（DSH 0.2.0-rc.2，1296×828 窗口）：
+
+| 动作 | 结果 |
+| --- | --- |
+| 点 (11.6%, 13.5%) 的「新会话」按钮 | **有效**，会话随后出现在 `sessionController.list` 里 |
+| `Ctrl+N`（`session.new` 的默认绑定，`primary+KeyN`） | **无效**：SendKeys 送得进去，界面毫无反应；所以走真实点击，不发组合键 |
+| `SendKeys` 送 ASCII 到输入框 | **有效**，但**要先点一下输入框**给它焦点 |
+| Unicode `SendInput` 送中文 | **无效且无声**：Windows 收下了（每个字符返回 2），输入框一个字都不显示 |
+| 剪贴板 + 原生 `Ctrl+V` | **无效且无声**：返回 ok，输入框仍是空的 |
+| `Ctrl+A` / `{BACKSPACE}` 清空输入框 | **无效**：草稿清不掉 |
+| 侧边栏的未发送草稿 | **会跨「新会话」保留**：新会话打开时输入框里可能还留着上一次的话 |
+
+结论：**GUI 负责建会话，第一条消息交给 API。** 想让 GUI 也送字就打开 `config.create.submitInGui`，
+脚本会在「输入框里已有草稿」（`composer-not-empty`，用回读像素判定）或「正文非 ASCII」
+（`text-not-ascii`）时明确拒绝，而不是把两段话接在一起。
 
 ## 四个工具
 

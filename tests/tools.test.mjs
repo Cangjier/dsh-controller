@@ -74,7 +74,9 @@ test('dsh_control guide 能列全部工具，也能只渲染一个动作', async
   assert.equal(one.action, 'create')
   assert.deepEqual(one.required, ['text'])
   assert.ok(one.detail.length > 0)
-  assert.equal(one.route.preferred, 'api')
+  // create 是唯一的例外：它声明 GUI 优先、API 兜底。
+  assert.equal(one.route.preferred, 'ui')
+  assert.equal(one.route.fallback, 'api')
 
   await assert.rejects(() => control.execute({ action: 'guide', tool: 'dsh_nope' }, {}), /没有名为/)
   await assert.rejects(() => control.execute({ action: 'guide', tool: 'dsh_sessions', actionName: 'nope' }, {}), /没有动作/)

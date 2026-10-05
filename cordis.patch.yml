@@ -10,8 +10,9 @@
 # `name` 是**模块说明符**，不是展示名：它按「DSH 安装目录 → profile 目录」
 # 两个锚点解析，所以必须写成装进 profile 的那个包名 `dsh-controller`。
 #
-# 配置分三类：
+# 配置分四类：
 #   - api:  API 路径的偏好（是否允许在 API 可用时仍然强制走 UI；等待空闲的超时）
+#   - create: 新建会话走哪条路（默认 GUI 优先、失败退 API）以及那条路用到的坐标
 #   - ui:   桌面自动化回退（PowerShell 超时、截图目录、DSH 窗口标题匹配）
 #   - guard: 危险动作的门槛（创建会话 / 安装插件是否必须显式确认）
 
@@ -24,12 +25,34 @@
 
         api:
           # 允许在 API 可用时强制走桌面自动化（排查 API 路径时用）。null = 不允许，
-          # 也就是每个动作都优先 API —— 这是本插件的默认主张。
+          # 也就是每个动作都优先 API —— create 是唯一例外，见下面 create.via。
           forceUi: false
           # `dsh_sessions {action:"wait"}` 的默认等待上限（毫秒）。
           defaultWaitMs: 120000
           # 动作级超时（毫秒）：创建/投递/中止这类调用不会无限等。
           actionTimeoutMs: 30000
+
+        create:
+          # auto = 先点真实窗口的「新会话」，失败整条退回 API（默认）；
+          # gui  = 只走 GUI，失败就报错，绝不偷偷用 API；
+          # api  = 完全不碰窗口，旧行为。
+          via: auto
+          # 「新会话」按钮中心在窗口里的位置（宽高比例）。实测 1296x828 窗口上是 (150, 112)。
+          newSessionX: 0.116
+          newSessionY: 0.135
+          # 新会话的输入框与发送按钮位置（宽高比例，实测 (790, 468) 与 (1119, 484)）。
+          # 会话内的输入框在窗口里低得多（约 86%/93%），那是另一套坐标。
+          composerX: 0.61
+          composerY: 0.565
+          # 点击后给界面切换的时间，以及等待新会话出现在列表里的上限（毫秒）。
+          settleMs: 1200
+          waitMs: 15000
+          # 单次 GUI 动作（点击）的超时（毫秒）。
+          clickTimeoutMs: 45000
+          # 第一条消息是否也在 GUI 里敲进去。默认 false：实测这台机器上 DSH 的输入框只吃
+          # SendKeys 的 ASCII，中文既进不去（Unicode SendInput 无声失败）又清不掉（旧草稿会
+          # 被接在后面），所以消息默认交给 API 投递。打开它时脚本会在有草稿或非 ASCII 时拒绝。
+          submitInGui: false
 
         ui:
           # DSH 桌面窗口的标题匹配（大小写不敏感的子串）。null = 用进程名匹配。

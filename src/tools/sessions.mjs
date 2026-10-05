@@ -1,9 +1,11 @@
 /**
  * `dsh_sessions` —— 读和控制 DSH 的对话本身。
  *
- * 这是本插件的核心：开一条新对话、往一条已有对话里投话、中止、等待、改名。全部走 DSH 自己的
- * API（`sessionController` / `agents` / `sessions` / `sessionTitle`），没有一条路径是去点 GUI 的——
- * 因为点 GUI 既不可靠，也拿不到「这条消息真的落盘了吗」这个答案。
+ * 开一条新对话、往一条已有对话里投话、中止、等待、改名。读路径走 DSH 自己的 API
+ * （`sessionController` / `agents` / `sessions` / `sessionTitle`）——因为点 GUI 拿不到
+ * 「这条消息真的落盘了吗」这个答案。唯一的例外是 `create`：它默认先点 DSH 自己的
+ * 「新会话」按钮，**再用 API 确认会话真的出现了**，失败则整条退回 API 建会话。
+ * 换句话说，GUI 负责建，证据来自 API；两条路都全有或全无，不会建出两条对话。
  *
  * @module dsh-controller/tools/sessions
  */
@@ -16,6 +18,9 @@ export const SESSIONS_ACTIONS = ['list', 'get', 'create', 'send', 'abort', 'wait
 
 /** 投递模式：下一轮 / 当前轮中途引导 / 只加模型可见上下文。 */
 const SEND_MODES = ['followup', 'steer', 'inject']
+
+/** 新建会话的通道：GUI 优先并回退 / 只 GUI / 只 API。 */
+const CREATE_VIA = ['auto', 'gui', 'api']
 
 /**
  * 造 `dsh_sessions` 的工具定义。
@@ -36,6 +41,7 @@ export function createSessionsTool(host, config) {
       cwd: { type: 'string', description: 'create: absolute working directory for the new conversation. Defaults to the calling session\'s cwd.' },
       title: { type: 'string', description: 'create / rename: the conversation title.' },
       preset: { type: 'string', description: 'create: agent preset id (for example "standard"). Defaults to the host default.' },
+      via: { type: 'string', enum: CREATE_VIA, description: 'create: "auto" (default) clicks the real New Session button and falls back to the API when the GUI path fails; "gui" refuses to fall back; "api" never touches the window. The GUI path takes the window foreground.' },
       mode: { type: 'string', enum: SEND_MODES, description: 'send: "followup" (default, next turn), "steer" (mid-turn guidance), "inject" (model-visible context only, does not wake the driver).' },
       keepInbox: { type: 'boolean', description: 'abort: true keeps queued and steering work, aborting only the running turn. Default false (clears the inbox too).' },
       timeoutMs: { type: 'number', description: 'wait: how long to wait for idle before answering "still running". Default from config.api.defaultWaitMs.' },
@@ -79,6 +85,7 @@ export function createSessionsTool(host, config) {
           cwd: args.cwd ?? context?.cwd,
           title: args.title,
           preset: args.preset,
+          via: args.via,
         })
       },
 
