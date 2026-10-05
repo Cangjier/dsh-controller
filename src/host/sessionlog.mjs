@@ -187,7 +187,6 @@ export function summarizeFromDisk(log, options = {}) {
   if (open) state = quietSec * 1000 > staleMs ? 'STALLED' : 'RUNNING'
   else if (lastTurnEnd == null && boundary == null) state = 'UNKNOWN'
 
-  const goalRow = projection?.rows?.goal?.val ?? null
   return {
     sessionId: log.sessionId,
     workspaceKey: log.workspaceKey,
@@ -200,12 +199,60 @@ export function summarizeFromDisk(log, options = {}) {
     quietSec,
     bytes: log.bytes,
     source: 'disk',
-    goal: goalRow?.current?.goal ? {
-      phase: goalRow.current.goal.phase,
-      roundsStarted: goalRow.current.roundsStarted,
-      maxGoalRounds: goalRow.current.goal.maxGoalRounds,
-      objective: goalRow.current.goal.objective,
-    } : null,
+    goal: goalFromProjection(projection),
+  }
+}
+
+/** 投影缓存里的 goal 行折成一行状态；没有就返回 null。两个摘要函数共用同一份折法。 */
+function goalFromProjection(projection) {
+  const goal = projection?.rows?.goal?.val?.current?.goal ?? null
+  if (goal === null) return null
+  return {
+    phase: goal.phase,
+    roundsStarted: projection.rows.goal.val.current.roundsStarted,
+    maxGoalRounds: goal.maxGoalRounds,
+    objective: goal.objective,
+  }
+}
+
+/**
+ * 一行**只从投影缓存与文件 mtime**得出的状态——不读日志。
+ *
+ * `summarizeFromDisk()` 为了折出 `openTurn` / `lastTurnReason` 会把日志尾巴整段解开并解析
+ * （默认 512KB，本机 478 条实测约 21ms/条）。但会话列表真正要的四个字段——`title` / `state` /
+ * `quietSec` / `goal`——投影缓存与文件 mtime 已经全部给出：投影里的 `turnBoundary` 有值，
+ * 「回合是否还开着」就有了和 GUI 同一份的权威答案，日志在这条路上一个字节都不需要读。
+ *
+ * 所以这里**只回答投影能证明的部分**。投影缺失、或里面还没有 `turnBoundary` 行时返回 `null`，
+ * 让调用方明确地退回 `summarizeFromDisk()`，而不是拿一串 null 假装那就是状态。
+ * `state` 的判法必须与 `summarizeFromDisk()` 逐字一致，否则两条路会给出不同的答案。
+ * @param {object} log - `listSessionLogs()` 的一项。
+ * @param {object} [options] - `{ now, staleMs }`。
+ * @returns {object|null} 状态行；证据不足时是 `null`。
+ */
+export function summarizeFromProjection(log, options = {}) {
+  const projection = readProjection(log.sessionId)
+  const rows = projection?.rows ?? {}
+  const boundary = rows.turnBoundary?.val ?? null
+  if (projection === null || boundary === null) return null
+
+  const now = options.now ?? Date.now()
+  const staleMs = options.staleMs ?? 300_000
+  // mtime 取「日志文件」与「投影文件」里更新的那个，和 summarizeFromDisk() 一致。
+  const activityMs = Math.max(log.mtimeMs ?? 0, projection.mtimeMs ?? 0)
+  const quietSec = Math.max(0, Math.round((now - activityMs) / 1000))
+  const open = boundary.openTurnStartSeq !== null
+
+  return {
+    sessionId: log.sessionId,
+    workspaceKey: log.workspaceKey,
+    workspace: projection.identity?.cwd ?? log.workspace,
+    title: rows.title?.val ?? null,
+    state: open ? (quietSec * 1000 > staleMs ? 'STALLED' : 'RUNNING') : 'IDLE',
+    quietSec,
+    bytes: log.bytes,
+    source: 'projection',
+    goal: goalFromProjection(projection),
   }
 }
 

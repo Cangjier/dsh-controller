@@ -3,9 +3,31 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import zlib from 'node:zlib'
 import { adapter, probe, userMessage } from '../src/host/services.mjs'
 import { hostIdentity } from '../src/host/restart.mjs'
 import { normalizeConfig } from '../index.mjs'
+
+/** 造一段和会话日志同构的字节：若干独立 zstd 帧直接拼接（和 sessionlog.test.mjs 同款）。 */
+function buildLog(frames) {
+  return Buffer.concat(frames.map((lines) => zlib.zstdCompressSync(Buffer.from(lines.map((line) => JSON.stringify(line)).join('\n') + '\n', 'utf8'))))
+}
+
+/** 在一个临时 DSH home 里跑一段代码，跑完把目录和两个环境变量都还原。 */
+async function withTempHome(fn) {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-controller-home-'))
+  const savedHome = process.env.DSH_HOME
+  const savedProfileDir = process.env.DSH_PROFILE_DIR
+  try {
+    process.env.DSH_HOME = home
+    delete process.env.DSH_PROFILE_DIR
+    return await fn(home)
+  } finally {
+    if (savedHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = savedHome
+    if (savedProfileDir === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = savedProfileDir
+    rmSync(home, { recursive: true, force: true })
+  }
+}
 
 /** 一个可控的假宿主：只需要给 `get(name)`，就当作真的服务树。 */
 function contextWith(services) {
@@ -65,11 +87,119 @@ test('listSessions 走 sessionController.list，并把 running 带出来', async
 })
 
 test('listSessions 在没有任何会话服务时退回磁盘，并且明说这件事', async () => {
-  const warnings = []
-  const host = adapter(contextWith({}), normalizeConfig(undefined))
-  const rows = await host.listSessions({ workspace: 'all' }, warnings)
-  assert.ok(Array.isArray(rows))
-  assert.ok(warnings.some((warning) => warning.includes('退回磁盘扫描')))
+  // 这条用例必须有自己的 DSH home：磁盘回退读的是真实 `~/.dsh`，否则它会去读这台机器上
+  // 全部会话日志（实测 476 条 = 12s），既慢又依赖机器状态。
+  await withTempHome(async (home) => {
+    const sessionDir = join(home, 'sessions', '--C-w--', 'session-disk')
+    mkdirSync(sessionDir, { recursive: true })
+    writeFileSync(join(sessionDir, 'session.v4.jsonl.zstd'), buildLog([
+      [{ type: 'turn/start', seq: 1, data: { turn: 1 } }],
+    ]))
+
+    const warnings = []
+    const host = adapter(contextWith({}), normalizeConfig(undefined))
+    const rows = await host.listSessions({ workspace: 'all' }, warnings)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].source, 'disk:sessions')
+    assert.equal(rows[0].state, 'RUNNING', '磁盘状态是从日志里读出来的，不是元数据编的')
+    assert.ok(warnings.some((warning) => warning.includes('退回磁盘扫描')))
+  })
+})
+
+test('getSession 在没有 sessionQuery.readSession 时从磁盘兜底读，而不是抛错', async () => {
+  // 这条用例守的是「磁盘兜底分支」：它曾经引用了一个已被改名的内部函数（`logsBySession`），
+  // 而那是一个只在运行期才会炸的悬空引用——所有用例都从别的分支走过去了，所以谁都没发现。
+  await withTempHome(async (home) => {
+    const sessionDir = join(home, 'sessions', '--C-w--', 'session-disk')
+    mkdirSync(sessionDir, { recursive: true })
+    writeFileSync(join(sessionDir, 'session.v4.jsonl.zstd'), buildLog([
+      [{ type: 'session', id: 'session-disk', cwd: 'C:\\w' }],
+      [{ type: 'turn/start', seq: 1, data: { turn: 1 } }],
+    ]))
+
+    const host = adapter(contextWith({}), normalizeConfig(undefined))
+    const detail = await host.getSession({ sessionId: 'session-disk', tail: 5 })
+    assert.equal(detail.sessionId, 'session-disk')
+    assert.equal(detail.events.length, 2, '磁盘兜底要把事件读出来')
+    assert.equal(detail.header?.id, 'session-disk', 'header 从日志里的 session 事件补出来')
+  })
+})
+
+test('listSessions 的磁盘富化只发生在要返回的行上（先裁剪、再读磁盘）', async () => {
+  await withTempHome(async (home) => {
+    const workspaceDir = join(home, 'sessions', '--C-w--')
+    // 三行里只有 updatedAt 最大的那一行会进结果；只为它建日志，另两行没有日志也不该出错。
+    mkdirSync(join(workspaceDir, 'session-newest'), { recursive: true })
+    writeFileSync(join(workspaceDir, 'session-newest', 'session.v4.jsonl.zstd'), buildLog([
+      [{ type: 'turn/start', seq: 1, data: { turn: 1 } }],
+    ]))
+    const host = adapter(contextWith({
+      sessionController: {
+        list: () => [
+          { sessionId: 'session-newest', running: false, blank: false, cwd: 'C:\\w', updatedAt: 30 },
+          { sessionId: 'session-middle', running: false, blank: false, cwd: 'C:\\w', updatedAt: 20 },
+          { sessionId: 'session-oldest', running: false, blank: false, cwd: 'C:\\w', updatedAt: 10 },
+        ],
+      },
+    }), normalizeConfig(undefined))
+
+    const rows = await host.listSessions({ workspace: 'all', limit: 1 })
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].sessionId, 'session-newest')
+    assert.equal(rows[0].source, 'api:sessionController.list')
+
+    // `enrich: false` 时连这一行都不读磁盘：quietSec 保持 null 而不是被填上。
+    const bare = await host.listSessions({ workspace: 'all', limit: 3, enrich: false })
+    assert.equal(bare.length, 3)
+    assert.ok(bare.every((row) => row.quietSec === null))
+  })
+})
+
+test('listSessions 不按条调用 sessionQuery.readTitle：标题从投影缓存拿', async () => {
+  // 这条用例守的是一个**性能正确性**问题，不是装饰：`readTitle(id)` 每次调用都会把全部持久化
+  // 会话重新枚举一遍再整篇读那条日志，放进按条循环就是 478 × 478 次文件读（本机实测一次 list
+  // 要 5 分 20 秒）。所以这里既断言它一次都没被调用，也断言标题照样出得来。
+  await withTempHome(async (home) => {
+    const workspaceDir = join(home, 'sessions', '--C-w--')
+    for (const id of ['session-a', 'session-b']) {
+      const dir = join(workspaceDir, id)
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'session.v4.jsonl.zstd'), buildLog([
+        [{ type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } }],
+      ]))
+    }
+    const projectionDir = join(home, 'storages', 'session_projcache', 'sessions')
+    mkdirSync(projectionDir, { recursive: true })
+    writeFileSync(join(projectionDir, 'session-a.json'), JSON.stringify({
+      version: 7,
+      record: {
+        identity: { formatVersion: 4, createdAt: 1, cwd: 'C:\\w' },
+        rows: {
+          turnBoundary: { ver: 2, seq: 3, val: { openTurnStartSeq: null, lastTurn: 1 } },
+          title: { ver: 1, seq: 3, val: '只在投影里的标题' },
+        },
+      },
+    }))
+
+    let readTitleCalls = 0
+    const host = adapter(contextWith({
+      sessionQuery: {
+        listSessions: () => [
+          { header: { id: 'session-a', cwd: 'C:\\w', createdAt: 20 } },
+          { header: { id: 'session-b', cwd: 'C:\\w', createdAt: 10 } },
+        ],
+        readTitle: () => { readTitleCalls += 1; return { title: '从日志折出来的标题' } },
+      },
+    }), normalizeConfig(undefined))
+
+    const rows = await host.listSessions({ workspace: 'all', limit: 2 })
+    assert.equal(readTitleCalls, 0, 'readTitle 绝不允许出现在按条循环里')
+    assert.equal(rows.length, 2)
+    assert.equal(rows[0].sessionId, 'session-a', 'updatedAt 大的排前面')
+    assert.equal(rows[0].title, '只在投影里的标题', '标题来自投影缓存，不是空着')
+    assert.equal(rows[0].state, 'IDLE', '投影里的 turnBoundary 说了回合已经闭合')
+    assert.equal(rows[0].source, 'api:sessionQuery.listSessions')
+  })
 })
 
 test('sendToSession 投递一条 user 消息并确认落盘', async () => {

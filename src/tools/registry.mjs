@@ -81,7 +81,8 @@ export const TOOLS = {
         use: '先看清有哪些对话、哪条在跑。',
         detail: [
           '参数：`workspace`（绝对路径或 `all`，默认 `all`）、`limit`（默认 20）。',
-          '返回每条会话的 `{ sessionId, title, workspace, state, openTurn, lastActivitySec, goal }`。',
+          '返回每条会话的 `{ sessionId, title, workspace, state, running, goal, quietSec, updatedAt }`。',
+          '标题取自投影缓存（与 GUI 侧边栏同一份），不是每条重新折一遍日志——那会让一次 list 变成分钟级。',
           '状态判定：回合未闭合且最近有写入 = RUNNING；回合未闭合且长时间没写入 = STALLED；',
           '回合已闭合 = IDLE。判定只依赖磁盘证据，因此对刚崩溃的会话有最多 5 分钟的误判窗口。',
         ],

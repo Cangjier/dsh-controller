@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { dshHome, profileDir, profileName } from './paths.mjs'
-import { listSessionLogs, readLog, readProjection, summarizeFromDisk } from './sessionlog.mjs'
+import { listSessionLogs, readLog, readProjection, summarizeFromDisk, summarizeFromProjection } from './sessionlog.mjs'
 import {
   PLAN_VERSION,
   hostIdentity,
@@ -244,13 +244,34 @@ export function adapter(ctx, config, deps = {}) {
       if (typeof exit !== 'function') throw new Error('宿主没有提供 ctx.appExit')
       return exit(code)
     }
-  const logsBySession = () => new Map(listSessionLogs().map((entry) => [entry.sessionId, entry]))
+  /**
+   * 建一次会话目录索引。
+   *
+   * **一次工具调用只建一次。** `listSessionLogs()` 要遍历 `~/.dsh/sessions` 下每个工作区、每条会话
+   * 并逐个 stat：本机 476 条会话实测 61ms。原先每个会话行都重建一次这份索引，一次 `listSessions`
+   * 就变成 476 × 61ms ≈ 29s 的二次项（实测 `overview` 因此要 33.5s）。一次调用里的目录快照本来
+   * 就该是同一份，所以这里不做过期，只要求调用方建一次、传下去。
+   * @returns {Map<string, object>} 会话 id → `listSessionLogs()` 的条目。
+   */
+  const buildLogIndex = () => new Map(listSessionLogs().map((entry) => [entry.sessionId, entry]))
 
-  /** 这条会话日志的磁盘事实；找不到日志时返回 null。 */
-  const diskState = (sessionId, warnings) => {
+  /**
+   * 这条会话日志的磁盘事实；找不到日志时返回 null。
+   * @param {string} sessionId - 会话 id。
+   * @param {string[]} warnings - 警告收集器。
+   * @param {Map<string, object>} index - `buildLogIndex()` 的结果；必须由调用方复用，不要每行重建。
+   * @param {object} [options] - `{ light }`：`light: true` 表示「列表只要 title/state/quietSec/goal」，
+   * 投影缓存能回答就不读日志尾巴；投影不足以判定时**仍然**退回完整读法，不是猜。
+   * @returns {object|null} 磁盘状态行。
+   */
+  const diskState = (sessionId, warnings, index, options = {}) => {
     try {
-      const entry = logsBySession().get(sessionId)
+      const entry = index.get(sessionId)
       if (entry === undefined) return null
+      if (options.light === true) {
+        const light = summarizeFromProjection(entry)
+        if (light !== null) return light
+      }
       return summarizeFromDisk(entry)
     } catch (error) {
       warnings.push(`读磁盘会话状态失败：${error instanceof Error ? error.message : String(error)}`)
@@ -266,7 +287,10 @@ export function adapter(ctx, config, deps = {}) {
         const list = get(ctx, 'workspaceRegistry')?.list?.()
         return Array.isArray(list) ? list.map((workspace) => ({ id: workspace.id, path: workspace.path, title: workspace.title ?? null, sessions: Array.isArray(workspace.sessionIds) ? workspace.sessionIds.length : null })) : null
       })
-      const sessions = await this.listSessions({ workspace: 'all', limit: 1000 }, warnings)
+      // 概览只要两个数：会话总条数与「在跑」的条数，两者都直接来自 API。所以这里既不取磁盘事实
+      // （`enrich: false`——476 条会话的磁盘富化实测要 10.9s，而这两个数一个字节都用不上），
+      // 也不裁到 500（`limit: 'all'`），否则 `total` 会静默地说一个假数字。
+      const sessions = await this.listSessions({ workspace: 'all', limit: 'all', enrich: false }, warnings)
       const selection = await attempt('agentDefaultModel.currentSelection', warnings, () => get(ctx, 'agentDefaultModel')?.currentSelection?.() ?? null)
 
       return {
@@ -322,7 +346,8 @@ export function adapter(ctx, config, deps = {}) {
         }
       }
 
-      const disk = diskState(sessionId, warnings)
+      // 只查这一条会话，所以索引也是这里建一次：`diskState` 不自己建，免得回到「每行一次枚举」。
+      const disk = diskState(sessionId, warnings, buildLogIndex())
       const rows = projection?.rows ?? {}
       const state = live?.status === 'running'
         ? 'RUNNING'
@@ -355,12 +380,52 @@ export function adapter(ctx, config, deps = {}) {
     /**
      * 列出会话。优先 `sessionController.list()`（自带 running 与 agentAvailable），
      * 再退 `sessionQuery.listSessions()`，最后退磁盘扫描。
-     * @param {object} args - `{ workspace, limit }`。
+     *
+     * **磁盘富化是这里唯一昂贵的一步，所以它被挪到筛选之后。** `title` / `state` / `quietSec` /
+     * `goal` 只能从 `~/.dsh/sessions` 与投影缓存读出来，代价是「每条会话读一段日志 + zstd 解压」——
+     * 本机 476 条实测 10.9s。原来的写法在建行的循环里逐行读磁盘、**然后才**筛选与裁剪，等于为了
+     * 20 行结果把 476 条全读一遍。现在先用 API 字段建行、筛选排序、裁到 `limit`，只给真的要返回的
+     * 那些行补磁盘事实。
+     *
+     * **`sessionQuery.readTitle` 不允许出现在任何按条循环里。** 它每次调用都会把全部持久化会话
+     * 重新枚举一遍（`persistence.list()` 要打开每条日志读首行）再整篇读那条日志，所以「每条都调
+     * 一次」是 478 × 478 次文件读：本机实测一次 `list` 要 5 分 20 秒。标题改由投影缓存提供，
+     * 且只对真正返回的行读——见 `enrichDisk` 的 `light` 路径。
+     *
+     * `enrich: false` 表示连富化都跳过：内部调用方（概览只要计数、GUI 建会话只要 id 的集合差、
+     * 重启前只要 `running`）用不上 `title` / `quietSec` / `goal`，而每个都要等那一轮磁盘活。
+     * @param {object} args - `{ workspace, limit, enrich }`；`limit: 'all'` 表示不裁剪。
      * @param {string[]} [outerWarnings] - 调用方的警告收集器。
      * @returns {Promise<object[]>} 归一化后的会话行。
      */
     async listSessions(args = {}, outerWarnings) {
       const warnings = outerWarnings ?? []
+      const enrich = args.enrich !== false
+
+      /**
+       * 只给要返回的那些行补磁盘事实。
+       * @param {object[]} rows - 已经筛过、裁过的行。
+       * @param {Function} titleOf - `(row, disk) => string|null`，让每个分支保留自己的标题优先级。
+       * @returns {object[]} 补好的行。
+       */
+      const enrichDisk = (rows, titleOf) => {
+        if (rows.length === 0) return rows
+        // 索引只建一次，传给每一行——这是原来那个二次项的修复点。
+        const index = buildLogIndex()
+        return rows.map((row) => {
+          // `light`：列表要的四个字段投影缓存就有，不必为每一行解开 512KB 的日志尾巴。
+          const disk = diskState(row.sessionId, warnings, index, { light: true })
+          return {
+            ...row,
+            title: titleOf(row, disk),
+            workspace: row.workspace ?? disk?.workspace ?? null,
+            state: row.running === true ? 'RUNNING' : disk?.state ?? row.state,
+            quietSec: disk?.quietSec ?? null,
+            goal: disk?.goal ?? null,
+          }
+        })
+      }
+
       const controller = get(ctx, 'sessionController')
       let usedSource = null
       const summaries = await attempt('sessionController.list', warnings, async () => {
@@ -371,26 +436,23 @@ export function adapter(ctx, config, deps = {}) {
 
       if (Array.isArray(summaries)) {
         usedSource = 'api:sessionController.list'
-        const rows = []
-        for (const summary of summaries) {
-          const disk = diskState(summary.sessionId, warnings)
-          rows.push({
-            sessionId: summary.sessionId,
-            title: titleText(disk?.title ?? summary.title ?? null),
-            workspace: summary.cwd ?? disk?.workspace ?? null,
-            running: summary.running === true,
-            agentAvailable: summary.agentAvailable === true,
-            blank: summary.blank === true,
-            parentSessionId: summary.parentSessionId ?? null,
-            origin: summary.origin ?? null,
-            updatedAt: summary.updatedAt ?? null,
-            state: summary.running === true ? 'RUNNING' : disk?.state ?? 'IDLE',
-            quietSec: disk?.quietSec ?? null,
-            goal: disk?.goal ?? null,
-            source: 'api:sessionController.list',
-          })
-        }
-        return filterAndSort(rows, args)
+        const rows = summaries.map((summary) => ({
+          sessionId: summary.sessionId,
+          title: titleText(summary.title ?? null),
+          workspace: summary.cwd ?? null,
+          running: summary.running === true,
+          agentAvailable: summary.agentAvailable === true,
+          blank: summary.blank === true,
+          parentSessionId: summary.parentSessionId ?? null,
+          origin: summary.origin ?? null,
+          updatedAt: summary.updatedAt ?? null,
+          state: summary.running === true ? 'RUNNING' : 'IDLE',
+          quietSec: null,
+          goal: null,
+          source: 'api:sessionController.list',
+        }))
+        const selected = filterAndSort(rows, args)
+        return enrich ? enrichDisk(selected, (row, disk) => titleText(disk?.title ?? row.title ?? null)) : selected
       }
 
       const query = get(ctx, 'sessionQuery')
@@ -401,36 +463,83 @@ export function adapter(ctx, config, deps = {}) {
         const rows = []
         for (const record of records) {
           const header = record.header ?? {}
+          // `agents.get` 是一次 Map 查表（`AgentRegistry.get`），不是磁盘读，所以每条都问没关系。
           const agent = await attempt('agents.get', warnings, () => (typeof agents?.get === 'function' ? agents.get(header.id) : null))
-          const disk = diskState(header.id, warnings)
-          const title = await attempt('sessionQuery.readTitle', warnings, () => query.readTitle?.(header.id) ?? null)
           rows.push({
             sessionId: header.id,
-            title: titleText(title) ?? disk?.title ?? null,
-            workspace: header.cwd ?? disk?.workspace ?? null,
+            // **不在这里读标题。** `sessionQuery.readTitle(id)` 看着是一条记录，实际每一次都要
+            // 先把全部持久化会话重新枚举一遍（`corpus.projectMany()` → `persistence.list()` →
+            // 逐个打开日志读首行取 header），再把那条日志**整篇**读出来折标题。放在这个循环里
+            // 就是 478 × 478 次文件读：本机实测一次 `list` 要 **5 分 20 秒**（tool/call →
+            // tool/result 320.7s，另一次 293.9s），而且与 `limit` 无关——裁剪发生在循环之后。
+            // 列表要的那个标题投影缓存里就有（`sessionlog.mjs` 的 `summarizeFromProjection()`），
+            // 而且只在真正要返回的那几行上读，所以这里留 null，让 `titleOf` 去取。
+            title: null,
+            workspace: header.cwd ?? null,
             running: agent?.status === 'running',
             agentAvailable: agent !== null && agent !== undefined,
             blank: null,
             parentSessionId: header.parentSession ?? null,
             origin: header.origin ?? null,
             updatedAt: header.createdAt ?? null,
-            state: agent?.status === 'running' ? 'RUNNING' : disk?.state ?? 'IDLE',
-            quietSec: disk?.quietSec ?? null,
-            goal: disk?.goal ?? null,
+            state: agent?.status === 'running' ? 'RUNNING' : 'IDLE',
+            quietSec: null,
+            goal: null,
             source: 'api:sessionQuery.listSessions',
           })
         }
-        return filterAndSort(rows, args)
+        const selected = filterAndSort(rows, args)
+        return enrich ? enrichDisk(selected, (row, disk) => row.title ?? titleText(disk?.title ?? null)) : selected
       }
 
       warnings.push('sessionController.list 与 sessionQuery.listSessions 都不可用，退回磁盘扫描')
       usedSource = 'disk:sessions'
-      const rows = listSessionLogs().map((log) => {
-        const summary = summarizeFromDisk(log)
+
+      /**
+       * 一行磁盘事实。`light` 先走投影缓存：能证明状态就不读日志尾巴。
+       * 注意这里的 `state` / `title` / `goal` 因此有两个来源（投影或日志），`source` 字段会写出来。
+       */
+      const diskRow = (log) => {
+        const summary = summarizeFromProjection(log) ?? summarizeFromDisk(log)
         return { ...summary, running: summary.state === 'RUNNING', agentAvailable: false, blank: null, updatedAt: log.mtimeMs, source: 'disk:sessions' }
+      }
+      /** 只靠目录元数据的一行。mtime 就是 `updatedAt`，够排序与裁剪，一个字节的日志都不用读。 */
+      const metadataRow = (log) => ({
+        sessionId: log.sessionId,
+        title: null,
+        workspace: log.workspace,
+        running: false,
+        agentAvailable: false,
+        blank: null,
+        updatedAt: log.mtimeMs,
+        state: 'UNKNOWN',
+        quietSec: Math.max(0, Math.round((Date.now() - log.mtimeMs) / 1000)),
+        goal: null,
+        source: 'disk:sessions',
       })
+
+      const logs = listSessionLogs()
+      // 两条路都可能走到这里，所以「先裁剪再读」这个优化不能无条件用：
+      //   - `enrich: false` 的调用方要的正是「哪条在跑」，而「在跑」必须对每条会话都得出一个答案
+      //     —— 不能只算要返回的几行；
+      //   - 按 `workspace` 过滤时，工作区目录名是有损编码，真实 cwd 只在投影里 —— 也必须全量
+      //     （元数据行的 workspace 只是目录名还原出来的显示值）。
+      // 其余情况（默认的 `list`：workspace=all、要完整字段）可以只读要返回的那几行。
+      //
+      // 「全量」说的是**每条都要出一个结论**，不等于每条都要读日志：`diskRow` 先走投影缓存，
+      // 投影能证明 `state` 就不解开日志尾巴。投影缺失时才退到整段读，所以这里不会因为
+      // 「全量」再次变成 478 次 512KB 解码。
+      const workspaceIsAll = args.workspace === undefined || args.workspace === 'all'
+      if (args.enrich === false || !workspaceIsAll) {
+        const all = logs.map(diskRow)
+        void usedSource
+        return filterAndSort(all, args)
+      }
+
+      const logsById = new Map(logs.map((log) => [log.sessionId, log]))
+      const selected = filterAndSort(logs.map(metadataRow), args)
       void usedSource
-      return filterAndSort(rows, args)
+      return selected.map((row) => diskRow(logsById.get(row.sessionId)))
     },
 
     /**
@@ -452,7 +561,7 @@ export function adapter(ctx, config, deps = {}) {
         header = snapshot.session ?? header
         events = Array.isArray(snapshot.events) ? snapshot.events : []
       } else {
-        const entry = logsBySession().get(args.sessionId)
+        const entry = buildLogIndex().get(args.sessionId)
         if (entry !== undefined) {
           const log = readLog(entry.file)
           events = log.events
@@ -536,7 +645,7 @@ export function adapter(ctx, config, deps = {}) {
         return { ok: false, reason: `找不到可操作的 DSH 窗口（${window?.reason ?? 'window 动作没有返回目标'}）`, evidence: { window } }
       }
 
-      const before = await attempt('listSessions(before)', warnings, () => this.listSessions({ workspace: 'all', limit: 500 }))
+      const before = await attempt('listSessions(before)', warnings, () => this.listSessions({ workspace: 'all', limit: 500, enrich: false }))
       if (!Array.isArray(before)) {
         return { ok: false, reason: '会话列表读不出来，无法确认 GUI 是否真的建了会话' }
       }
@@ -627,7 +736,7 @@ export function adapter(ctx, config, deps = {}) {
       while (Date.now() < deadline) {
         rounds += 1
         await new Promise((resolve) => setTimeout(resolve, 250))
-        const rows = await attempt('listSessions(gui-watch)', warnings, () => this.listSessions({ workspace: 'all', limit: 500 }))
+        const rows = await attempt('listSessions(gui-watch)', warnings, () => this.listSessions({ workspace: 'all', limit: 500, enrich: false }))
         if (Array.isArray(rows)) {
           const fresh = rows.filter((row) => !known.has(row.sessionId))
           if (fresh.length > 0) {
@@ -843,7 +952,9 @@ export function adapter(ctx, config, deps = {}) {
       // 按最近活动排序时排在最前面；但「撞到上限」这件事必须说出来——悄悄少停一条会话，
       // 比明确报一条警告糟得多。
       const SCAN_LIMIT = 500
-      const rows = await this.listSessions({ workspace: 'all', limit: SCAN_LIMIT }, warnings)
+      // `enrich: false`：「谁在跑」取的是 API 的 `running`，磁盘状态在这里只用来判 `staleRisk`，
+      // 而那是 API 缺席时才有的情况（那时走的是磁盘回退分支，本来就带磁盘字段）。
+      const rows = await this.listSessions({ workspace: 'all', limit: SCAN_LIMIT, enrich: false }, warnings)
       const running = rows.filter((row) => row.running === true)
       const source = rows[0]?.source ?? 'none'
       const truncated = rows.length >= SCAN_LIMIT
@@ -1342,7 +1453,12 @@ export function adapter(ctx, config, deps = {}) {
 /** 按工作区与数量筛选、按最近活动排序。 */
 function filterAndSort(rows, args) {
   const workspace = args.workspace ?? 'all'
-  const limit = Math.max(1, Math.min(args.limit ?? 20, 500))
+  // `args.limit === 'all'` 是给「只要计数」的内部调用方用的（`overview`）：`sessionController.list()`
+  // 本来就把全部会话一次交出来，再裁到 500 只会把一个假数字写进 `sessions.total`。公开的 list 动作
+  // 仍然受 500 这个上限保护，行为不变。
+  const limit = args.limit === 'all'
+    ? Number.POSITIVE_INFINITY
+    : Math.max(1, Math.min(args.limit ?? 20, 500))
   const filtered = workspace === 'all'
     ? rows
     : rows.filter((row) => typeof row.workspace === 'string' && row.workspace.toLowerCase() === String(workspace).toLowerCase())

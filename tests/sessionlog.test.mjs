@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import zlib from 'node:zlib'
-import { decodeFrames, listSessionLogs, parseEventLines, readLog, summarizeFromDisk } from '../src/host/sessionlog.mjs'
+import { decodeFrames, listSessionLogs, parseEventLines, readLog, summarizeFromDisk, summarizeFromProjection } from '../src/host/sessionlog.mjs'
 
 /** 造一段和会话日志同构的字节：若干**独立** zstd 帧直接拼接。 */
 function buildLog(frames) {
@@ -76,9 +76,41 @@ test('磁盘状态：回合未闭合 = RUNNING，闭合 = IDLE', () => {
     const stalled = summarizeFromDisk(logs[0], { staleMs: -1 })
     assert.equal(stalled.state, 'STALLED')
 
+    // 快路径：只靠投影缓存与 mtime，一个字节的日志都不读。会话列表用它，所以它必须和完整
+    // 读法给出同样的答案，否则「快」只是把慢换成了错。
+    const light = summarizeFromProjection(logs[0])
+    assert.equal(light.state, summary.state)
+    assert.equal(light.title, summary.title)
+    assert.equal(light.workspace, summary.workspace)
+    assert.equal(light.quietSec, summary.quietSec)
+    assert.deepEqual(light.goal, summary.goal)
+    assert.equal(summarizeFromProjection(logs[0], { staleMs: -1 }).state, 'STALLED')
+
     const tail = readLog(logs[0].file)
     assert.equal(tail.events.length, 2)
     assert.equal(tail.truncated, false)
+  } finally {
+    if (savedHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = savedHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('投影不足以判定状态时 summarizeFromProjection 返回 null，而不是猜一个', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-controller-test-'))
+  const savedHome = process.env.DSH_HOME
+  try {
+    process.env.DSH_HOME = home
+    const sessionDir = join(home, 'sessions', '--C-w--', 'session-bare')
+    mkdirSync(sessionDir, { recursive: true })
+    writeFileSync(join(sessionDir, 'session.v4.jsonl.zstd'), buildLog([
+      [{ type: 'session', id: 'session-bare', cwd: 'C:\\w' }],
+      [{ type: 'turn/start', seq: 1, data: { turn: 1 } }],
+    ]))
+
+    const logs = listSessionLogs()
+    assert.equal(summarizeFromProjection(logs[0]), null, '没有投影就没有权威判据，必须明说不知道')
+    // 退回完整读法仍然给得出状态：快路径不是「唯一一条路」，是「先走的那条」。
+    assert.equal(summarizeFromDisk(logs[0]).state, 'RUNNING')
   } finally {
     if (savedHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = savedHome
     rmSync(home, { recursive: true, force: true })
