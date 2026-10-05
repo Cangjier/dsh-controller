@@ -22,11 +22,10 @@ import {
   hostIdentity,
   planPath,
   probeDesktopShell,
-  probeWatcherAlive,
   readLogTail,
   readPlanResult,
   sameBoot,
-  spawnWatcher,
+  spawnRelauncher,
   watcherLogPath,
   writePlan,
 } from './restart.mjs'
@@ -228,22 +227,14 @@ async function attempt(label, warnings, fn) {
  */
 export function adapter(ctx, config, deps = {}) {
   const desktop = typeof deps.runDesktop === 'function' ? deps.runDesktop : runDesktop
-  // 重启这件事的副作用入口全部可替换：真机上它们会真的问 Windows、真的起进程、真的请求退出，
+  // 重启这件事的副作用入口全部可替换：真机上它们会真的问 Windows、真的起进程，
   // 而测试必须能在不碰这台机器的前提下走完同一条代码路径。
   const probeShell = typeof deps.probeShell === 'function' ? deps.probeShell : probeDesktopShell
-  const startWatcher = typeof deps.startWatcher === 'function' ? deps.startWatcher : spawnWatcher
-  const watcherAlive = typeof deps.watcherAlive === 'function' ? deps.watcherAlive : probeWatcherAlive
+  const startRelauncher = typeof deps.startRelauncher === 'function' ? deps.startRelauncher : spawnRelauncher
   const loadPlan = typeof deps.readPlan === 'function' ? deps.readPlan : readPlanResult
   const savePlan = typeof deps.writePlan === 'function' ? deps.writePlan : writePlan
   const later = typeof deps.later === 'function' ? deps.later : (fn, ms) => setTimeout(fn, ms)
   const clock = typeof deps.now === 'function' ? deps.now : () => Date.now()
-  const requestExit = typeof deps.requestExit === 'function'
-    ? deps.requestExit
-    : (code) => {
-      const exit = get(ctx, 'appExit')
-      if (typeof exit !== 'function') throw new Error('宿主没有提供 ctx.appExit')
-      return exit(code)
-    }
   /**
    * 建一次会话目录索引。
    *
@@ -1020,11 +1011,13 @@ export function adapter(ctx, config, deps = {}) {
      *   - 看门狗**先起来**：它起不来就不请求退出（宁可重启不发生，也不要退出去回不来）；
      *   - 退出是**延迟**的，否则本次工具结果会跟着这一轮一起消失。
      *
-     * **`requestExit` 关的是 Host 自己，不是桌面应用**（`ctx.appExit` = Host 的关停，实测启动器
-     * 源码如此）：壳会带着一个没有后端的窗口留下来——那就是「重连中」。所以计划里同时记下
-     * `shellPid` 与 `hostPid`，由看门狗等 Host 走完、再请壳关窗（不行就强杀），最后才拉起 exe。
+     * **重启是「进程外交接」的，不是 Host 自己关停。** 实测：`ctx.appExit` 只关 Host（启动器
+     * `exit: code => void shutdown.shutdown(code)`），桌面壳留下一个没有后端的窗口——「重连中」；
+     * 而关掉主窗口这个应用也不一定退（实测进程树活了 90 秒以上）。所以真正让应用消失的是进程外那个
+     * 延时脚本：先给 `killAfterSeconds` 秒优雅退出的机会，到点收掉整棵树，再拉起 exe。
+     * 插件这一侧只负责「计划落盘、会话停好、脚本起来」——三件都不依赖应用能不能优雅退出。
      *
-     * 调用者自己那条会话不在立即停止之列，而是在退出前一刻收掉（见 `pauseAll`）。
+     * 调用者自己那条会话不在立即停止之列，而是在交接前一刻收掉（见 `pauseAll`）。
      * @param {object} args - `{ keepInbox, text, delaySeconds, dryRun, sessionIds, callerSessionId, reason }`。
      * @returns {Promise<object>} 计划与证据；`dryRun: true` 时只快照、不碰任何状态。
      */
@@ -1034,13 +1027,14 @@ export function adapter(ctx, config, deps = {}) {
       const dryRun = args.dryRun === true
       const keepInbox = args.keepInbox ?? config.restart.keepInbox
 
-      // 1. 先证伪：找不到壳、或没有退出入口，就什么都不做。
+      // 1. 先证伪：找不到桌面壳就什么都不做。
+      //
+      // **不再要求 `ctx.appExit`**：实测它是 Host 自己的关停（启动器 `exit: code => void
+      // shutdown.shutdown(code)`），桌面应用根本不会跟着退——壳留下一个没有后端的窗口，也就是
+      // 「重连中」那一屏。这条路已经废掉，退出交给进程外的延时脚本。
       const shell = await probeShell()
       if (shell?.ok !== true) {
         throw new Error(`看不到可以重新拉起的桌面壳：${shell?.reason ?? '壳探测没有返回结果'}。headless 的 dsh 请自己重启进程，插件不猜。`)
-      }
-      if (dryRun !== true && get(ctx, 'appExit') === undefined) {
-        throw new Error('宿主没有提供 ctx.appExit —— 没有请求退出的入口（托盘菜单「重启应用与 Host」是产品自己的那条路）')
       }
 
       const callerSessionId = typeof args.callerSessionId === 'string' && args.callerSessionId !== '' ? args.callerSessionId : null
@@ -1122,38 +1116,41 @@ export function adapter(ctx, config, deps = {}) {
       // 6. 停止结果落盘：退出之后没人能补写。
       savePlan(plan)
 
-      // 7. 看门狗：起不来就绝不请求退出。
-      let watcher
+      // 7. 延时脚本：起不来就绝不动这个应用（宁可重启没发生，也不要关了回不来）。
+      let relauncher
       try {
-        watcher = await startWatcher({
+        relauncher = await startRelauncher({
           shellPid: shell.shellPid,
           hostPid: shell.hostPid,
           exe: shell.exe,
-          timeoutSeconds: config.restart.watcherTimeoutSeconds,
+          waitSeconds: config.restart.waitSeconds,
           settleMs: config.restart.settleMs,
-          shellGraceSeconds: config.restart.shellGraceSeconds,
+          killAfterSeconds: config.restart.killAfterSeconds,
         })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         plan.state = 'failed'
-        plan.failure = `看门狗起不来：${message}`
+        plan.failure = `延时脚本起不来：${message}`
         savePlan(plan)
-        throw new Error(`看门狗起不来，已取消退出（会话已经停了，但 DSH 还在跑）：${message}`)
+        throw new Error(`延时脚本起不来，已取消重启（会话已经停了，但 DSH 还在跑）：${message}`)
       }
       // `method` 是证据的一部分：`wmi` = 新进程挂在 WmiPrvSE 下、不在 DSH 的进程树里；
       // `detached` = 只是分离的子进程（壳若用 kill-on-close 的 Job Object，它会跟着走）。
       plan.watcher = {
-        pid: watcher.pid ?? null,
-        method: watcher.method ?? null,
-        shell: watcher.shell ?? null,
-        logPath: watcher.logPath,
-        script: watcher.script,
-        attempts: watcher.attempts ?? [],
+        pid: relauncher.pid ?? null,
+        method: relauncher.method ?? null,
+        shell: relauncher.shell ?? null,
+        logPath: relauncher.logPath,
+        script: relauncher.script,
+        attempts: relauncher.attempts ?? [],
       }
       savePlan(plan)
 
-      // 8. 延迟关停：先让本次工具结果送达，再收掉调用者那一轮，最后请求 Host 关停。
-      //    这一句关的是**本进程**：壳会留下来（界面停在「重连中」），所以看门狗那边还等着收尾。
+      // 8. 延迟收尾：先让本次工具结果送达，再收掉调用者那一轮。
+      //
+      // **这里不请求 appExit。** 实测它只关 Host：壳留下一个没有后端的窗口（「重连中」），
+      // 而进程外那个脚本等的是「整棵树走干净」——所以真正让应用退出的是脚本那一侧：给优雅退出
+      // 留 `killAfterSeconds` 的宽限，到点收掉整棵树，然后拉起 exe。
       const delayMs = Math.max(1, delaySeconds) * 1000
       plan.exit = { delaySeconds, scheduledAt: new Date(clock()).toISOString() }
       savePlan(plan)
@@ -1162,26 +1159,9 @@ export function adapter(ctx, config, deps = {}) {
           if (callerSessionId !== null) {
             try { await this.abortSession({ sessionId: callerSessionId, keepInbox }) } catch { /* 退出在即，收不掉也照样退 */ }
           }
-          // 最后一道闸：看门狗在这几秒里死了的话，退出就等于把 DSH 关掉且没人拉起来。
-          if (Number.isFinite(watcher.pid)) {
-            const alive = await watcherAlive(watcher.pid)
-            if (alive === false) {
-              plan.state = 'failed'
-              plan.failure = `退出前发现看门狗（pid ${watcher.pid}）已经不在了，取消退出`
-              try { savePlan(plan) } catch { /* 写不动就只剩日志 */ }
-              return
-            }
-          }
-          try {
-            // 记录「请求已经发出」：否则事后无法区分「没走到这一步」和「请求了但没人响应」。
-            plan.exit.requestedAt = new Date(clock()).toISOString()
-            try { savePlan(plan) } catch { /* 写不动就只剩日志 */ }
-            requestExit(0)
-          } catch (error) {
-            plan.state = 'failed'
-            plan.failure = `请求退出失败：${error instanceof Error ? error.message : String(error)}`
-            try { savePlan(plan) } catch { /* 写不动就只剩日志 */ }
-          }
+          // 记录「交接完成」：否则事后分不清「没走到这一步」和「交接了但没人响应」。
+          plan.exit.handedOffAt = new Date(clock()).toISOString()
+          try { savePlan(plan) } catch { /* 写不动就只剩日志 */ }
         })()
       }, delayMs)
 
@@ -1195,7 +1175,7 @@ export function adapter(ctx, config, deps = {}) {
         willResume: sessions,
         resumeText,
         exitInSeconds: delaySeconds,
-        note: `这个 Host 进程会在约 ${delaySeconds} 秒后关停（ctx.appExit 关的是 Host，不是桌面壳），看门狗等它走后请壳关窗、必要时强杀，然后拉起应用；重启后插件按计划把这些会话继续起来。`,
+        note: `进程外的延时脚本（pid ${plan.watcher.pid ?? '?'}）在等应用整棵树退出：先给 ${config.restart.killAfterSeconds} 秒优雅退出的机会，到点收掉整棵树，然后拉起 exe。约 ${delaySeconds} 秒后应用会被重启，重启后插件按计划把这些会话继续起来。`,
         warnings,
       }
     },

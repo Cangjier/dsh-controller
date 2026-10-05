@@ -63,7 +63,7 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 | --- | --- | --- |
 | `dsh_control` | `overview` `capabilities` `session` `transport` `guide` | 只读；`capabilities` 逐项探测 18 个服务与两条 UI 通道 |
 | `dsh_sessions` | `list` `get` `create` `send` `abort` `wait` `rename` | `sessionController` / `agents` / `sessions` / `sessionTitle` |
-| `dsh_host` | `pause-all` `restart` `status` `resume` | 停止与继续走 `agents` / `sessionController`；退出走 `ctx.appExit`；**重新拉起由进程外的看门狗完成**；`status` 只读磁盘 |
+| `dsh_host` | `pause-all` `restart` `status` `resume` | 停止与继续走 `agents` / `sessionController`；**退出与重新拉起都由进程外的延时脚本完成**；`status` 只读磁盘 |
 | `dsh_plugins` | `list` `inventory` `enable` `disable` `install` `remove` `inspect` `log` | `pluginManager`；`log` 只能读磁盘 |
 | `dsh_ui` | `window` `look` `click` `type` `key` `scroll` | 桌面自动化（最后手段） |
 
@@ -98,36 +98,40 @@ DSH 插件：**让 agent 控制 DSH 自身**。
    本次调用的那一轮一起收掉，工具结果就再也送不回去；它排在退出前一刻收。
 5. **计划成型落盘**——状态改成 `armed`，写进 `<DSH home>/controller/restart-plan.json`。退出之后没有任何
    代码能补写，所以它必须先写。
-6. **看门狗先起来**——它**不属于 DSH 的进程树**：优先用 WMI（`Win32_Process.Create`）起，新进程的父进程
+6. **延时脚本先起来**——它**不属于 DSH 的进程树**：优先用 WMI（`Win32_Process.Create`）起，新进程的父进程
    是 `WmiPrvSE.exe`（实测），所以即使桌面壳用 kill-on-close 的 Job Object 收子进程也带不走它；WMI 不可用
-   时才退回 `detached` spawn。它起不来就**不请求退出**：宁可重启没发生，也不要退出去回不来。
-7. **延迟关停**——默认 6 秒后才 `ctx.appExit(0)`，为的就是让上面的结果先送达调用方。关停前还会回读一次
-   看门狗是否还活着（`probeWatcherAlive`），它已经不在了就取消——退出去且没人拉起来是最坏的结局。
+   时才退回 `detached` spawn。它起不来就**不动这个应用**：宁可重启没发生，也不要关了回不来。
+7. **延迟交接**——默认 6 秒后才收掉调用者那一轮并落 `handedOffAt`，为的就是让上面的结果先送达调用方。
+   之后插件不再做任何事：应用怎么消失、怎么回来，全部由那个进程外的脚本负责（见下）。
 
-整个动作的时间预算是 **180s**（探壳 20s + 看门狗 30s + 余量）：比它内部每一步的上限都大，否则会在看门狗
-已经起来之后把结果掐掉，而那时关停还在排队——那正是「按了没反应」的另一种形态。
+整个动作的时间预算是 **180s**：比它内部每一步的上限都大，否则会在脚本已经起来之后把结果掐掉。
 
-### 两个 pid：`appExit` 关的是 Host，不是桌面应用
+### 退出：`appExit` 不行，关窗也不行（都是实测）
 
-这一条是**实测**出来的，也是「重启之后界面一直显示重连中、只能手动退出再打开」的原因：
+这一段的每一条都是真机上量出来的，也是「重启没效果、界面停在重连中」的全部原因：
 
 - `ctx.appExit(0)` 是 **Host 子进程自己的关停**——启动器把它接成
   `exit: code => void shutdown.shutdown(code)`（`apps/cli/src/profile-boot.ts`），**桌面应用不会跟着退**。
-- 于是 Host 走了、后端没了，而 Electron 主进程还活着：界面停在「重连中」，谁也拉不起来。
-- 托盘菜单那条路为什么行：它在**壳自己进程内**，是 `app.relaunch() + app.exit()`，Host 侧够不着。
+  于是 Host 走了、后端没了，而 Electron 主进程还活着：界面停在「重连中」，谁也拉不起来。
+- **关掉主窗口（`WM_CLOSE`，也就是点 X）也不退出**：窗口消失，进程树 **90 秒以上**一个没退。
+- 托盘那条路要先把应用窗口关掉/最小化才够得着（窗口覆盖整个屏幕、任务栏又是自动隐藏），
+  而且这台机器上通知区域被折叠、**UIA 下 0 个子元素**——托盘图标无法被程序发现，只能靠坐标。
+- 所以：**没有任何一条「应用自己退出」的路可以在无人值守时依赖**。
 
-所以计划里记的是两个 pid，看门狗分三段干活：
+真正让应用消失的是**进程外那个延时脚本**（`src/host/relaunch-watch.ps1`），插件只负责交接：
 
 ```
-1. 等 hostPid 消失        ← 这才是 appExit 真的会做到的事（超时 → 放弃，退 3）
-2. 请 shellPid 关主窗口     ← CloseMainWindow()，等 shellGraceSeconds（默认 8s）
-   还没走就 Stop-Process -Force  ← 留着它就会和新实例抢同一个 profile
-3. 确认没有同名进程残留 → Start-Process 拉起 exe
+1. 计划落盘（arming → armed）+ 停会话 + 起延时脚本   ← 插件这一侧，全部可验证
+2. 延迟 delaySeconds 后收掉调用者那一轮，交接完成     ← 之后插件什么都不做
+3. 脚本：给 killAfterSeconds（默认 10s）优雅退出的机会
+   → 到点 Stop-Process 掉整棵树（同名进程全属同一个应用实例）
+   → 确认干净（否则放弃，绝不启动第二个实例）
+   → Start-Process 拉起 exe
 ```
 
-任何一段超时它都**放弃并且不启动第二个实例**，并且在 `restart-watch.log` 里写清放弃在哪一段。
-脚本还能在没拿到 `-HostPid` 时自己找：壳的子进程里命令行带 `--expose-internals` 的那个就是 Host
-（实测从壳那一层看是唯一的），所以「脚本已经是新的、加载中的 Node 还是旧的」那一格也能正确工作。
+代价说清楚：第 3 步的强杀**不是优雅退出**——会话日志已经 flush、计划已经落盘、恢复腿已经准备好，
+所以数据面是安全的；丢的是应用的收尾动作（可能在极少数情况下留下孤儿子进程）。换来的是
+**一个确定会发生的重启**，而不是一个「有时不退、退了也说不清」的重启。
 
 重启后的恢复腿挂在 bundle 加载期：读那份计划，`sessionController` 还没装配就每 3 秒重试（最多
 `resumeWaitMs`），然后对每条会话 `resolveAgent + followup` 投一条「继续」（默认正文
@@ -137,7 +141,7 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 - **先 claim 再投**：投递前把状态写成 `claimed` 落盘，投到一半崩了也不会从头再来一遍；
 - **过期不恢复**：超过 `planTtlSeconds`（默认 15 分钟）的计划改成 `expired`，隔夜才打开的应用不会突然满血复活。
 
-`dsh_host {action:"status"}` 读的就是那份计划与看门狗日志（`transport: "disk"`——它们只存在于磁盘上，
+`dsh_host {action:"status"}` 读的就是那份计划与延时脚本的日志（`transport: "disk"`——它们只存在于磁盘上，
 这不是降级，而是唯一存在的地方）。想只看不动，用 `restart {dryRun:true}`（**不需要 `confirm`**：它不写盘、
 不停会话、不退出，而它恰恰就是「先说清要停掉哪些会话」的那一步）：它照样会跑「先证伪」与快照那两步，
 所以「这台机器上到底能不能重启」在没有副作用的情况下就能问出答案。
@@ -149,7 +153,7 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 2. disk     ~/.dsh 下的真实文件  服务缺席时仍然能读会话状态、能读插件操作日志
 3. cli      `dsh plugin …`       pluginManager 缺席时安装/卸载的退路（见下）
 4. ui       真实鼠标键盘          只有 GUI 才有的东西
-5. process  DSH 之外的进程        重启看门狗：退出之后唯一还活着、能把应用拉起来的东西
+5. process  DSH 之外的进程        延时脚本：退出之后唯一还活着、能把应用拉起来的东西
 ```
 
 `dsh_control {action:"capabilities"}` 会把当前进程实测结果摆出来（含每个服务原型上的方法名——版本之间
@@ -204,9 +208,9 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 | `guard.requireConfirmForRestart` | `true` | `dsh_host {action:"restart"}` 是否必须带 `confirm:true`（`dryRun:true` 不需要） |
 | `restart.enabled` | `true` | 启动时是否检查并执行恢复计划 |
 | `restart.delaySeconds` | `6` | 请求退出前的延迟：本次工具结果要先送达 |
-| `restart.watcherTimeoutSeconds` | `180` | 看门狗等 **Host 子进程**关停的上限；到点放弃，不启动第二个实例 |
-| `restart.settleMs` | `1500` | Host 走后再等多久才动桌面壳（让会话日志写完） |
-| `restart.shellGraceSeconds` | `8` | 请桌面壳关主窗口后等多久；还不走就强杀——否则它会和新实例抢 profile |
+| `restart.waitSeconds` | `120` | 延时脚本等「整棵树走干净」的上限；到点放弃，不启动第二个实例 |
+| `restart.settleMs` | `1500` | 整棵树干净后再等多久才拉起（让会话日志写完） |
+| `restart.killAfterSeconds` | `10` | 给应用优雅退出的宽限；到点还没退就收掉整棵树再拉起（实测它可能既不退也不报错） |
 | `restart.maxResume` | `20` | 一次最多自动继续多少条会话 |
 | `restart.planTtlSeconds` | `900` | 计划的有效期；过期不再恢复 |
 | `restart.resumeText` | `继续上次未完成的工作。` | 重启后投给每条会话的正文 |
@@ -218,7 +222,7 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 ## 验证
 
 ```powershell
-node --test "tests/*.test.mjs"   # 80 个用例：配置归一化、路径编码、zstd 帧解码、工具契约、动作超时、宿主适配、重启计划与看门狗契约
+node --test "tests/*.test.mjs"   # 78 个用例：配置归一化、路径编码、zstd 帧解码、工具契约、动作超时、宿主适配、重启计划与延时脚本契约
 node selftest.mjs                # 不开 DSH 也能跑：磁盘回退 + 探测 + UI 回退找窗口 + 重启计划位置
 ```
 
@@ -227,17 +231,15 @@ node selftest.mjs                # 不开 DSH 也能跑：磁盘回退 + 探测 
 
 ## 已知边界
 
-- **重启是「进程外」完成的，而且只认桌面壳**。DSH 没有公开的 restart API。`ctx.appExit` 关的是 **Host
-  子进程**（启动器把它接成 `shutdown.shutdown(code)`），桌面应用不会跟着退——这是实测出来的，也是
-  「重启后界面停在重连中」的原因。壳自己的「重启应用与 Host」是 Electron 侧的
-  `app.relaunch() + exit()`，只在它自己进程内可达。所以本插件：写计划（含 `shellPid`/`hostPid`）+
-  起看门狗 + 延迟关停；看门狗等 Host 走、再请壳关窗（宽限期内不走就强杀），最后拉起 exe。
-  **跑在 headless 的 `dsh` CLI 里时它会明确拒绝**（那时看不到桌面壳，退出就回不来），而不是赌一把。
-- **强杀桌面壳是最后手段，而且只用在「后端已经关了」的壳上**：Host 已经优雅关停（会话日志在那之前
-  已 flush），剩下来的壳只是一个没有后端的窗口。不杀它才是错的——它会和新实例抢同一个 profile。
-  宽限期（`restart.shellGraceSeconds`）就是给「自己退得掉」留的余地；`restart-watch.log` 里写清了
-  这一次走的是哪一条。
-- **看门狗的存活方式是量出来的，不是假设的**。WMI 起的进程父进程是 `WmiPrvSE.exe`（实测），所以它不在
+- **重启是「进程外」完成的，而且只认桌面壳**。DSH 没有公开的 restart API，而且**没有一条「应用自己退出」
+  的路可以依赖**（实测三条：`ctx.appExit` 只关 Host、`WM_CLOSE` 关窗不退、托盘图标在这台机器上被折叠且
+  UIA 无可发现元素）。所以本插件只做三件可验证的事：写计划 + 停会话 + 起进程外的延时脚本；
+  脚本给优雅退出留 `killAfterSeconds` 的宽限，到点收掉整棵树再拉起 exe。
+  **跑在 headless 的 `dsh` CLI 里时它会明确拒绝**（那时看不到桌面壳，关了回不来），而不是赌一把。
+- **强杀是明说的代价，不是意外**：数据面是安全的（会话日志已 flush、计划已落盘、恢复腿已就绪），
+  丢的是应用自己的收尾动作（极少数情况下可能留下孤儿子进程）。换来的是一个**确定会发生的重启**。
+  `relaunch-watch.log` 里逐行写清了这一次是「自己退的」还是「到点被收掉的」。
+- **延时脚本的存活方式是量出来的，不是假设的**。WMI 起的进程父进程是 `WmiPrvSE.exe`（实测），所以它不在
   DSH 的进程树里；`detached` 只是退路。仍有残余风险：如果壳在退出时把**整个用户会话**里的进程都收走
   （目前没有观察到），重启就不会自动发生——那种情况下的兜底是「计划仍在盘上」，你手动打开 DSH 后恢复腿
   照样会把那些会话继续起来。

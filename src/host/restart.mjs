@@ -35,8 +35,8 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 /** 计划文件的版本；字段变了就加一，读到不认识的版本宁可报错也不猜。 */
 export const PLAN_VERSION = 1
 
-/** 看门狗脚本的绝对路径。 */
-export const WATCHER_SCRIPT = join(HERE, 'restart-watch.ps1')
+/** 延时脚本的绝对路径。 */
+export const RELAUNCH_SCRIPT = join(HERE, 'relaunch-watch.ps1')
 
 /** PowerShell 可执行文件：先 pwsh（7+），再 Windows PowerShell 5.1。 */
 const POWERSHELL_CANDIDATES = ['pwsh.exe', 'powershell.exe']
@@ -234,39 +234,38 @@ function wmiLaunchScript(base64CommandLine) {
 }
 
 /**
- * 起一个看门狗：等主进程退出，然后重新拉起 exe。
+ * 起一个「延时脚本」：等应用整棵树走干净（或到点把它收掉），然后重新拉起 exe。
  *
- * **它必须活在 DSH 的进程树之外**——DSH 一退，树内的一切都会被带走，那「谁来重启」就没有答案了。
+ * **它必须活在 DSH 的进程树之外**——应用一退，树内的一切都会被带走，那「谁来重启」就没有答案了。
  * 所以这里试两条路，先试更结实的那条：
  *
  *   1. **WMI**（`Win32_Process.Create`）：新进程的父亲是 WmiPrvSE，不在 DSH 的进程树里，因此即使
  *      桌面壳把子进程放进 kill-on-close 的 Job Object，它也收不走它。起来之后立刻回读 PID 确认活着。
  *   2. **detached spawn**：更简单，但只在壳没有那种 Job Object 时才够——所以它是退路，不是首选。
  *
- * 两条都不行就抛错：调用方会因此**不请求退出**。宁可重启没发生，也不要退出去回不来。
- * @param {object} spec - `{ shellPid, hostPid, exe, timeoutSeconds, settleMs, shellGraceSeconds }`。
+ * 两条都不行就抛错：调用方会因此**不动这个应用**。宁可重启没发生，也不要关了回不来。
+ *
+ * 脚本里的 `killAfterSeconds` 是**实测逼出来的兜底**：关掉主窗口之后这个应用可能既不退也不报错
+ * （实测进程树活了 90 秒以上），而一个「窗口没了但进程还在」的应用不是重启。所以给优雅退出留一段
+ * 宽限，到点就收掉整棵树（同名进程全属于同一个应用实例），再拉起。
+ * @param {object} spec - `{ shellPid, hostPid, exe, waitSeconds, settleMs, killAfterSeconds }`。
  * @param {object} [deps] - `{ exec, spawn, launchViaWmi }`，测试用。
- * @returns {Promise<{ pid: number|null, method: string, logPath: string, script: string, shell: string, attempts: object[] }>} 看门狗事实。
+ * @returns {Promise<{ pid: number|null, method: string, logPath: string, script: string, shell: string, attempts: object[] }>} 脚本事实。
  * @throws {Error} 脚本不存在，或两条路都起不来时。
  */
-export async function spawnWatcher(spec, deps = {}) {
-  if (!existsSync(WATCHER_SCRIPT)) throw new Error(`dsh-controller: 找不到看门狗脚本 ${WATCHER_SCRIPT}`)
+export async function spawnRelauncher(spec, deps = {}) {
+  if (!existsSync(RELAUNCH_SCRIPT)) throw new Error(`dsh-controller: 找不到延时脚本 ${RELAUNCH_SCRIPT}`)
   ensureStateDir()
   const logPath = watcherLogPath()
   const cliArgs = [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-    '-File', WATCHER_SCRIPT,
-    // `-MainPid` 是**旧版 Node 代码**用的名字（它当时传的是桌面壳 pid）。新代码两个 pid 都给，
-    // 脚本优先用 `-ShellPid`/`-HostPid`，并把 `-MainPid` 当壳 pid 的别名——这样「脚本已经是新的、
-    // 加载中的 Node 还是旧的」那一格也能正确工作（脚本是 spawn 时从磁盘读的）。
-    '-MainPid', String(spec.shellPid ?? spec.mainPid ?? 0),
-    '-ShellPid', String(spec.shellPid ?? spec.mainPid ?? 0),
-    '-HostPid', String(spec.hostPid ?? 0),
+    '-File', RELAUNCH_SCRIPT,
     '-Exe', String(spec.exe),
     '-LogPath', logPath,
-    '-TimeoutSeconds', String(Math.max(1, Math.round(spec.timeoutSeconds ?? 180))),
+    '-WaitSeconds', String(Math.max(1, Math.round(spec.waitSeconds ?? 120))),
     '-SettleMs', String(Math.max(0, Math.round(spec.settleMs ?? 1500))),
-    '-ShellGraceSeconds', String(Math.max(0, Math.round(spec.shellGraceSeconds ?? 8))),
+    '-ShellPid', String(spec.shellPid ?? 0),
+    '-KillAfterSeconds', String(Math.max(0, Math.round(spec.killAfterSeconds ?? 10))),
   ]
   const exec = typeof deps.exec === 'function' ? deps.exec : run
   const start = typeof deps.spawn === 'function' ? deps.spawn : spawn
@@ -283,7 +282,7 @@ export async function spawnWatcher(spec, deps = {}) {
         const parsed = parseJsonLine(`${result.stdout.toString('utf8')}\n${result.stderr.toString('utf8')}`)
         attempts.push({ method: 'wmi', shell, ok: parsed?.ok === true, pid: parsed?.pid ?? null, detail: parsed?.error ?? (parsed === null ? '没有可解析的输出' : null) })
         if (parsed?.ok === true) {
-          return { pid: parsed.pid ?? null, method: 'wmi', logPath, script: WATCHER_SCRIPT, shell, attempts }
+          return { pid: parsed.pid ?? null, method: 'wmi', logPath, script: RELAUNCH_SCRIPT, shell, attempts }
         }
       } catch (error) {
         if (error?.code === 'ENOENT') { attempts.push({ method: 'wmi', shell, ok: false, detail: 'ENOENT' }); continue }
@@ -296,7 +295,7 @@ export async function spawnWatcher(spec, deps = {}) {
       const child = start(shell, cliArgs, { detached: true, stdio: 'ignore', windowsHide: true })
       child.unref?.()
       attempts.push({ method: 'detached', shell, ok: child.pid !== undefined, pid: child.pid ?? null })
-      return { pid: child.pid ?? null, method: 'detached', logPath, script: WATCHER_SCRIPT, shell, attempts }
+      return { pid: child.pid ?? null, method: 'detached', logPath, script: RELAUNCH_SCRIPT, shell, attempts }
     } catch (error) {
       if (error?.code === 'ENOENT') { attempts.push({ method: 'detached', shell, ok: false, detail: 'ENOENT' }); continue }
       attempts.push({ method: 'detached', shell, ok: false, detail: error?.message ?? String(error) })
@@ -304,7 +303,7 @@ export async function spawnWatcher(spec, deps = {}) {
   }
 
   const detail = attempts.map((entry) => `${entry.method}/${entry.shell}: ${entry.detail ?? '失败'}`).join('；')
-  throw new Error(`dsh-controller: 看门狗起不来（WMI 与 detached 都试过了）：${detail}`)
+  throw new Error(`dsh-controller: 延时脚本起不来（WMI 与 detached 都试过了）：${detail}`)
 }
 
 /**

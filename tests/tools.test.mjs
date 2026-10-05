@@ -179,7 +179,8 @@ test('dsh_host 的 guide 说清 restart 要 confirm，并且路由写明重新�
   assert.deepEqual(guide.required, ['confirm'])
   assert.equal(guide.route.preferred, 'api')
   assert.equal(guide.route.fallback, 'process')
-  assert.ok(guide.detail.some((line) => line.includes('看门狗')))
+  assert.ok(guide.detail.some((line) => line.includes('延时脚本')))
+  assert.ok(guide.detail.some((line) => line.includes('killAfterSeconds')), '优雅退出的宽限期要说清楚')
 
   const transport = await control.execute({ action: 'transport' }, {})
   assert.equal(transport.routes['dsh_host.status'].preferred, 'disk')
