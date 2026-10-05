@@ -174,7 +174,24 @@ export function normalizeConfig(raw) {
       waitSeconds: optionalPositiveNumber(restart, 'waitSeconds', 120, 'config.restart.waitSeconds'),
       // 给应用优雅退出留的宽限（秒）：到点它还没退，脚本就收掉整棵树再拉起。
       // 实测这个应用关掉主窗口后可能既不退也不报错（进程树活了 90 秒以上），所以这段宽限是必须的。
+      // **开启 gracefulQuit 时，看门狗拿到的宽限是「这个值 + 优雅退出预算」**，否则它会在托盘点击
+      // 落地之前就把树收掉（见 restart.gracefulQuit）。
       killAfterSeconds: optionalPositiveNumber(restart, 'killAfterSeconds', 10, 'config.restart.killAfterSeconds'),
+      // 优雅退出那一腿：右键应用自己的托盘图标，点菜单里的「退出」。默认开着——它就是用户手工做的
+      // 那件事，成功时应用走的是自己的收尾流程，而不是被收掉进程树。
+      // 依赖 `dsh-computer-use` 的托盘能力；找不到它（或找不到图标/菜单项）时**自动退回收树**，
+      // 重启不会因为它而失败。关掉它就是老行为：直接交给看门狗。
+      gracefulQuit: optionalBoolean(restart, 'gracefulQuit', true, 'config.restart.gracefulQuit'),
+      // 这一腿的总预算（毫秒）：包含「找图标 + 读菜单 + 点中一项」。实测折叠区四个图标走完约 20–30 秒。
+      // 它同时也是看门狗多等的秒数，所以给得太大只会让「优雅失败」的兜底来得更晚。
+      gracefulQuitBudgetMs: optionalPositiveNumber(restart, 'gracefulQuitBudgetMs', 60_000, 'config.restart.gracefulQuitBudgetMs'),
+      // 要点的菜单项文字（按「包含」匹配，忽略大小写与 CJK 之间的空格）。中文界面是「退出」，
+      // 英文界面请改成 "Quit"；不含它时这一腿会明确报出菜单里实际有哪些项。
+      gracefulQuitItem: optionalString(restart, 'gracefulQuitItem', '退出', 'config.restart.gracefulQuitItem'),
+      // 识别菜单与 tooltip 用的语言。菜单文字是匹配的依据，所以它要和界面语言一致。
+      gracefulQuitLanguage: optionalString(restart, 'gracefulQuitLanguage', 'zh-Hans-CN', 'config.restart.gracefulQuitLanguage'),
+      // 托盘那一腿留下的截图（悬停与菜单的前后对照）放哪；null = 兄弟插件自己的 tmp/tray。
+      gracefulQuitScratchDir: optionalString(restart, 'gracefulQuitScratchDir', null, 'config.restart.gracefulQuitScratchDir'),
       // 整棵树干净之后再等多久才拉起（毫秒），让会话日志写完。
       settleMs: optionalPositiveNumber(restart, 'settleMs', 1500, 'config.restart.settleMs'),
       // 一次最多自动继续多少条会话：防止一次重启把一大片会话同时点着。

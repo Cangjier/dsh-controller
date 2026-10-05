@@ -16,6 +16,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { dshHome, profileDir, profileName } from './paths.mjs'
+import { iconNameFromExe, quitViaTray, watcherGraceSeconds } from './graceful-quit.mjs'
 import { listSessionLogs, readLog, readProjection, summarizeFromDisk, summarizeFromProjection } from './sessionlog.mjs'
 import {
   PLAN_VERSION,
@@ -231,6 +232,9 @@ export function adapter(ctx, config, deps = {}) {
   // 而测试必须能在不碰这台机器的前提下走完同一条代码路径。
   const probeShell = typeof deps.probeShell === 'function' ? deps.probeShell : probeDesktopShell
   const startRelauncher = typeof deps.startRelauncher === 'function' ? deps.startRelauncher : spawnRelauncher
+  // 优雅退出那一腿也会真的动鼠标，所以它同样必须可替换：测试要能在不碰这台机器的前提下走完
+  // 「先请它自己退、退不掉再看门狗收」这条路径。
+  const gracefulQuit = typeof deps.quitViaTray === 'function' ? deps.quitViaTray : quitViaTray
   const loadPlan = typeof deps.readPlan === 'function' ? deps.readPlan : readPlanResult
   const savePlan = typeof deps.writePlan === 'function' ? deps.writePlan : writePlan
   const later = typeof deps.later === 'function' ? deps.later : (fn, ms) => setTimeout(fn, ms)
@@ -1117,6 +1121,21 @@ export function adapter(ctx, config, deps = {}) {
       savePlan(plan)
 
       // 7. 延时脚本：起不来就绝不动这个应用（宁可重启没发生，也不要关了回不来）。
+      //
+      // 它的**强杀宽限**现在要把优雅退出那一腿的时间加进去：第 8 步会先去点托盘菜单里的「退出」，
+      // 那一次搜索实测要 20–30 秒（折叠区四个图标、每个悬停读 tooltip、读不出就开菜单），而看门狗
+      // 的默认宽限只有 10 秒——不加起来，看门狗会在点击落地之前就把进程树收掉，「优雅」就成了一句空话。
+      const gracefulSpec = config.restart.gracefulQuit
+        ? {
+            iconName: iconNameFromExe(shell.exe),
+            item: config.restart.gracefulQuitItem,
+            budgetMs: config.restart.gracefulQuitBudgetMs,
+            language: config.restart.gracefulQuitLanguage,
+          }
+        : null
+      const killAfterSeconds = gracefulSpec === null
+        ? config.restart.killAfterSeconds
+        : watcherGraceSeconds(gracefulSpec.budgetMs, config.restart.killAfterSeconds)
       let relauncher
       try {
         relauncher = await startRelauncher({
@@ -1125,7 +1144,7 @@ export function adapter(ctx, config, deps = {}) {
           exe: shell.exe,
           waitSeconds: config.restart.waitSeconds,
           settleMs: config.restart.settleMs,
-          killAfterSeconds: config.restart.killAfterSeconds,
+          killAfterSeconds,
         })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -1146,13 +1165,28 @@ export function adapter(ctx, config, deps = {}) {
       }
       savePlan(plan)
 
-      // 8. 延迟收尾：先让本次工具结果送达，再收掉调用者那一轮。
+      // 8. 延迟收尾：先让本次工具结果送达，再收掉调用者那一轮，然后**请应用自己退出**。
       //
-      // **这里不请求 appExit。** 实测它只关 Host：壳留下一个没有后端的窗口（「重连中」），
-      // 而进程外那个脚本等的是「整棵树走干净」——所以真正让应用退出的是脚本那一侧：给优雅退出
-      // 留 `killAfterSeconds` 的宽限，到点收掉整棵树，然后拉起 exe。
+      // **这里不请求 appExit。** 实测它只关 Host：壳留下一个没有后端窗口（「重连中」）。真正让应用
+      // 退出的是两条路，按顺序：
+      //
+      //   1. **优雅退出**（`quitViaTray`）：右键应用自己的托盘图标，点菜单里的「退出」——就是用户
+      //      手工做的那件事。它由 `dsh-computer-use` 的托盘能力完成，只看像素，不依赖无障碍接口。
+      //      成不成都会把结论写进计划（成功那一次往往写不完最后一句，因为应用正在退出；看门狗日志
+      //      才是那一刻的权威记录）。
+      //   2. **收进程树**：看门狗那一侧的兜底，宽限已经加上这一腿的预算。它一条都不是「优雅」，
+      //      但它是唯一被证明一定发生的机制——所以它留着，而且是默认结局。
+      //
+      // 顺序是先收调用者那一轮，再写「已交接」，最后才点退出：那一下之后应用随时会消失，盘子上的
+      // 东西必须先写完。
       const delayMs = Math.max(1, delaySeconds) * 1000
-      plan.exit = { delaySeconds, scheduledAt: new Date(clock()).toISOString() }
+      plan.exit = {
+        delaySeconds,
+        scheduledAt: new Date(clock()).toISOString(),
+        graceful: gracefulSpec === null
+          ? { enabled: false, reason: 'config.restart.gracefulQuit = false：直接交给看门狗收树' }
+          : { enabled: true, iconName: gracefulSpec.iconName, item: gracefulSpec.item, budgetMs: gracefulSpec.budgetMs, killAfterSeconds },
+      }
       savePlan(plan)
       later(() => {
         void (async () => {
@@ -1162,6 +1196,15 @@ export function adapter(ctx, config, deps = {}) {
           // 记录「交接完成」：否则事后分不清「没走到这一步」和「交接了但没人响应」。
           plan.exit.handedOffAt = new Date(clock()).toISOString()
           try { savePlan(plan) } catch { /* 写不动就只剩日志 */ }
+          if (gracefulSpec === null) return
+          // 这一腿自己绝不抛错：它失败时要做的事，与它不存在时完全相同——等看门狗。
+          const outcome = await gracefulQuit({
+            ...gracefulSpec,
+            scratchDir: config.restart.gracefulQuitScratchDir,
+          })
+          plan.exit.graceful = { ...plan.exit.graceful, ...outcome }
+          plan.exit.gracefulFinishedAt = new Date(clock()).toISOString()
+          try { savePlan(plan) } catch { /* 应用可能已经在退出了，写不动是正常的 */ }
         })()
       }, delayMs)
 
@@ -1175,7 +1218,12 @@ export function adapter(ctx, config, deps = {}) {
         willResume: sessions,
         resumeText,
         exitInSeconds: delaySeconds,
-        note: `进程外的延时脚本（pid ${plan.watcher.pid ?? '?'}）在等应用整棵树退出：先给 ${config.restart.killAfterSeconds} 秒优雅退出的机会，到点收掉整棵树，然后拉起 exe。约 ${delaySeconds} 秒后应用会被重启，重启后插件按计划把这些会话继续起来。`,
+        gracefulExit: plan.exit.graceful,
+        note: gracefulSpec === null
+          ? `进程外的延时脚本（pid ${plan.watcher.pid ?? '?'}）在等应用整棵树退出：先给 ${killAfterSeconds} 秒优雅退出的机会，到点收掉整棵树，然后拉起 exe。约 ${delaySeconds} 秒后应用会被重启，重启后插件按计划把这些会话继续起来。`
+          : `约 ${delaySeconds} 秒后，本插件会先点应用自己托盘菜单里的「${gracefulSpec.item}」（就是用户手工做的那件事），请它自己退出；`
+            + `成不成都不影响结局——进程外的延时脚本（pid ${plan.watcher.pid ?? '?'}）在等整棵树走干净，到点（${killAfterSeconds} 秒，已含优雅退出的预算）收掉它并拉起 exe。`
+            + '重启后插件按计划把这些会话继续起来。',
         warnings,
       }
     },
