@@ -6,3 +6,7 @@ tmp/
 
 # Local agent scratch, never part of the plugin.
 .agents/
+
+# 脚本每次运行都会把自己那份图片模板写在这里（建会话脚本的 + 按钮），
+# 它是从实拍裁出来的派生物，不是源码：脚本里那份 base64 才是源。
+scripts/*.plus.png

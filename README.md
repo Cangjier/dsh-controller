@@ -48,14 +48,20 @@ DSH 插件：**让 agent 控制 DSH 自身**。
 | 点 (11.6%, 13.5%) 的「新会话」按钮 | **有效**，会话随后出现在 `sessionController.list` 里 |
 | `Ctrl+N`（`session.new` 的默认绑定，`primary+KeyN`） | **无效**：SendKeys 送得进去，界面毫无反应；所以走真实点击，不发组合键 |
 | `SendKeys` 送 ASCII 到输入框 | **有效**，但**要先点一下输入框**给它焦点 |
-| Unicode `SendInput` 送中文 | **无效且无声**：Windows 收下了（每个字符返回 2），输入框一个字都不显示 |
-| 剪贴板 + 原生 `Ctrl+V` | **无效且无声**：返回 ok，输入框仍是空的 |
-| `Ctrl+A` / `{BACKSPACE}` 清空输入框 | **无效**：草稿清不掉 |
+| **本插件自己的** Unicode `SendInput` / 剪贴板 `Ctrl+V` 送中文 | **无效且无声**：Windows 收下了（每个字符返回 2），输入框一个字都不显示；`Ctrl+A`/退格也清不掉遗留草稿 |
 | 侧边栏的未发送草稿 | **会跨「新会话」保留**：新会话打开时输入框里可能还留着上一次的话 |
+| **`computer_keyboard` 的 Unicode 注入送中文**（dsh-computer-use） | **有效**：实测把 `脚本自检` 打进编辑框、OCR 读回一致，回车后消息提交成功 |
+| 工作区行的 `+` 按钮 | **只在指针悬停到该行时才存在**；点它建出来的会话就落在这个工作区里 |
 
-结论：**GUI 负责建会话，第一条消息交给 API。** 想让 GUI 也送字就打开 `config.create.submitInGui`，
-脚本会在「输入框里已有草稿」（`composer-not-empty`，用回读像素判定）或「正文非 ASCII」
-（`text-not-ascii`）时明确拒绝，而不是把两段话接在一起。
+结论：**建会话走 GUI，第一条消息优先跟着 GUI 一起走。**
+
+- 给了 `cwd` 时，GUI 腿先把整件事交给 `dsh-computer-use` 的脚本
+  （`scripts/dsh-new-conversation.mjs`，用 `computer_script {action:"run", dir}` 执行）：它按整行文字找到
+  那个工作区行、悬停后用**图片模板**认出该行的 `+`、点开，再把第一条消息打进编辑框并**读回确认**后回车。
+  中文因此进得去，会话也落在**指定的工作区**里——结果里 `method: "computer-script"`。
+- 脚本那条腿不行（没有 `cwd`、侧边栏里没有那一行、`+` 匹配不到）就退到点「新会话」按钮那条腿；
+  这条腿要不要在 GUI 里敲字仍由 `config.create.submitInGui` 决定（默认 `false`，即消息交给 API 投递）。
+- 两条 GUI 腿都不行才整条退回 API，绝不出现「GUI 建了一半 + API 再建一条」。
 
 ## 五个工具
 
@@ -239,6 +245,11 @@ Node 对同一个真实路径有模块缓存，换掉已加载的包本来就要
 | `ui.screenshotDir` | `<插件>/tmp/screens` | `look` 的落地目录 |
 | `ui.scriptTimeoutMs` | `60000` | 单次 PowerShell 动作超时 |
 | `ui.focusSettleMs` | `120` | 前台化后等待多久再确认 |
+| `create.via` | `auto` | 建会话走哪条路：`auto`（GUI 优先、失败退 API）/ `gui`（不许退）/ `api`（不碰窗口） |
+| `create.useScript` | `true` | GUI 腿是否先交给 `dsh-computer-use` 的脚本（给了 `cwd` 时才用得上） |
+| `create.scriptDir` | `<插件>/scripts` | 脚本库目录，用 `computer_script {action:"run", dir}` 执行——场景跟着它驱动的项目走 |
+| `create.scriptName` | `dsh-new-conversation` | 脚本名 |
+| `create.scriptTimeoutMs` | `60000` | 单次脚本运行的超时（脚本内部另有 300s/200 步的上限） |
 | `guard.requireConfirmForCreate` | `false` | 建会话是否必须带 `confirm:true` |
 | `guard.requireConfirmForPlugins` | `true` | 改插件状态是否必须带 `confirm:true` |
 | `guard.requireConfirmForRestart` | `true` | `dsh_host {action:"restart"}` 是否必须带 `confirm:true`（`dryRun:true` 不需要） |

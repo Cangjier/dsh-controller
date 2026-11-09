@@ -36,10 +36,18 @@
           actionTimeoutMs: 30000
 
         create:
-          # auto = 先点真实窗口的「新会话」，失败整条退回 API（默认）；
+          # auto = 先走 GUI（先脚本、后按钮），失败整条退回 API（默认）；
           # gui  = 只走 GUI，失败就报错，绝不偷偷用 API；
           # api  = 完全不碰窗口，旧行为。
           via: auto
+          # GUI 腿优先交给 dsh-computer-use 的脚本：它按整行文字在侧边栏找到目标工作区行，
+          # 悬停后用图片模板认出该行的 + 并点开，再把第一条消息打进编辑框、读回确认、回车。
+          # 与点按钮那条腿的差别：会话落在**指定的工作区**里，而且中文进得去。
+          # 脚本放在本仓库 scripts/ 下，用 computer_script {action:"run", dir} 执行（场景跟着项目走）。
+          # 没有 cwd 时（认不出工作区）自动让位给下面的按钮腿，不算失败。
+          useScript: true
+          scriptName: dsh-new-conversation
+          scriptTimeoutMs: 60000
           # 「新会话」按钮中心在窗口里的位置（宽高比例）。实测 1296x828 窗口上是 (150, 112)。
           newSessionX: 0.116
           newSessionY: 0.135
@@ -52,9 +60,9 @@
           waitMs: 15000
           # 单次 GUI 动作（点击）的超时（毫秒）。
           clickTimeoutMs: 45000
-          # 第一条消息是否也在 GUI 里敲进去。默认 false：实测这台机器上 DSH 的输入框只吃
-          # SendKeys 的 ASCII，中文既进不去（Unicode SendInput 无声失败）又清不掉（旧草稿会
-          # 被接在后面），所以消息默认交给 API 投递。打开它时脚本会在有草稿或非 ASCII 时拒绝。
+          # **按钮那条腿**是否把第一条消息也在 GUI 里敲进去。默认 false：本插件自己那条
+          # SendKeys 路只吃 ASCII，中文既进不去又清不掉（旧草稿会被接在后面），所以那条腿的
+          # 消息默认交给 API 投递。脚本那条腿不受这个开关影响——它总是自己敲、自己读回。
           submitInGui: false
 
         # 重启编排：停止所有在跑的会话 → 落盘计划 → 起进程外看门狗 → **请应用自己退出**（点它

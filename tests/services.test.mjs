@@ -410,6 +410,130 @@ test('GUI 建出了会话但第一条消息没送进去时，改由 API 投递�
   assert.ok(result.warnings.some((warning) => warning.includes('GUI 送字失败')))
 })
 
+test('给了 cwd 时建会话交给 dsh-computer-use 的脚本，本插件自己的桌面脚本一步都不走', async () => {
+  let listed = 0
+  const desktop = fakeDesktop(() => {
+    throw new Error('脚本那条腿成功时，不该碰本插件自己的桌面脚本')
+  })
+  const scriptCalls = []
+  const host = safeAdapter(
+    contextWith({
+      sessionController: {
+        list: async () => {
+          listed += 1
+          return listed === 1 ? [] : [{ sessionId: 'session-script', running: true, blank: false, cwd: 'C:\\w\\xl-example', updatedAt: 99 }]
+        },
+        resolveAgent: async () => {
+          throw new Error('GUI 已经把第一条消息发出去了，不该再投一遍')
+        },
+      },
+    }),
+    normalizeConfig({ create: { waitMs: 4000 } }),
+    {
+      runDesktop: desktop.run,
+      runComputerScript: async (spec) => {
+        scriptCalls.push(spec)
+        return {
+          ok: true,
+          stepCount: 11,
+          logs: ['点 + 416,701  score 1.000'],
+          error: null,
+          returned: { workspace: 'xl-example', row: { x: 195, y: 701 }, plus: { x: 416, y: 701 }, typed: '你好', sent: true, timeline: [] },
+        }
+      },
+    },
+  )
+
+  const result = await host.createSession({ text: '你好', cwd: 'C:\\Users\\Admin\\Documents\\GitHub\\xl-example', via: 'auto' })
+
+  assert.equal(result.transport, 'ui')
+  assert.equal(result.method, 'computer-script')
+  assert.equal(result.sessionId, 'session-script', '会话仍然由列表差认领，不靠脚本自己报')
+  assert.equal(result.workspace, 'xl-example')
+  assert.equal(result.firstMessage, 'ui')
+  assert.equal(scriptCalls.length, 1)
+  assert.equal(scriptCalls[0].name, 'dsh-new-conversation')
+  assert.equal(scriptCalls[0].args.workspace, 'xl-example', '工作区名取自 cwd 的最后一段')
+  assert.equal(scriptCalls[0].args.text, '你好')
+  assert.deepEqual(desktop.calls, [], '脚本那条腿成功时，本插件自己的桌面脚本一次都不调用')
+  assert.equal(result.evidence.plus.x, 416, '脚本报的落点进 evidence，便于事后核对')
+})
+
+test('脚本那条腿失败时改用点「新会话」按钮，而不是立刻退 API', async () => {
+  // 列表由「点过没有」驱动：脚本那条腿也会读一次列表，用调用次数计数会让按钮那条腿的
+  // 「点之前」快照里已经出现新会话，于是它自己认领不到东西。
+  let clicked = false
+  const desktop = fakeDesktop((action, args) => {
+    if (action === 'window') return { ok: true, target: { handle: 1 } }
+    clicked = true
+    if (args?.submit === true) return { ok: true, clicked: true, submitted: true, method: 'sendinput-unicode', sentChars: 2, pointerRestored: true }
+    return { ok: true, clicked: true, pointerRestored: true }
+  })
+  const host = safeAdapter(
+    contextWith({
+      sessionController: {
+        list: async () => (clicked ? [{ sessionId: 'gui-created', running: true, blank: true, cwd: 'C:\\w', updatedAt: 50 }] : []),
+      },
+    }),
+    normalizeConfig({ create: { waitMs: 4000, submitInGui: true } }),
+    {
+      runDesktop: desktop.run,
+      runComputerScript: async () => ({
+        ok: false,
+        error: { message: '侧边栏里找不到整行等于「xl-example」的行：两个方向都走过了。' },
+        returned: null,
+        logs: [],
+      }),
+    },
+  )
+
+  const result = await host.createSession({ text: '开工', cwd: 'C:\\w\\xl-example', via: 'auto' })
+
+  assert.equal(result.transport, 'ui')
+  assert.equal(result.method, undefined, '按钮那条腿没有 method 字段')
+  assert.equal(result.sessionId, 'gui-created')
+  assert.ok(result.warnings.some((warning) => warning.includes('脚本建会话失败，改用「新会话」按钮')))
+  assert.deepEqual(desktop.calls.map((call) => call.action), ['window', 'new-session', 'new-session'])
+})
+
+test('没有 cwd 时脚本那条腿直接让位，不产生一条「脚本失败」的警告', async () => {
+  let listed = 0
+  const desktop = fakeDesktop((action, args) => {
+    if (action === 'window') return { ok: true, target: { handle: 1 } }
+    if (args?.submit === true) return { ok: true, clicked: true, submitted: true, method: 'sendinput-unicode', sentChars: 2, pointerRestored: true }
+    return { ok: true, clicked: true, pointerRestored: true }
+  })
+  let scriptCalls = 0
+  const host = safeAdapter(
+    contextWith({
+      sessionController: {
+        list: async () => {
+          listed += 1
+          return listed === 1 ? [] : [{ sessionId: 'gui-created', running: true, blank: true, cwd: 'C:\\w', updatedAt: 50 }]
+        },
+      },
+    }),
+    normalizeConfig({ create: { waitMs: 4000, submitInGui: true } }),
+    {
+      runDesktop: desktop.run,
+      runComputerScript: async () => {
+        scriptCalls += 1
+        return { ok: true, returned: { sent: true } }
+      },
+    },
+  )
+
+  const result = await host.createSession({ text: '开工', via: 'auto' })
+
+  assert.equal(result.transport, 'ui')
+  assert.equal(scriptCalls, 0, '认不出工作区就不该去叫脚本')
+  assert.equal(
+    result.warnings.some((warning) => warning.includes('脚本建会话失败')),
+    false,
+    'skipped 不是失败，不该留下误导性的警告',
+  )
+})
+
 test('createSession 在 via:"api" 时完全不碰 GUI', async () => {
   const agent = fakeAgent({ id: 'session-api' })
   const desktop = fakeDesktop(() => { throw new Error('via:"api" 不该碰桌面通道') })

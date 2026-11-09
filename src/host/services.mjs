@@ -1,6 +1,8 @@
 /**
  * 宿主适配层：**读和控制先走 DSH 自己的 API，读不到才退回磁盘**；唯一例外是
- * `createSession()`——它默认先点真实窗口里的「新会话」，失败再整条退回 API。
+ * `createSession()`——它默认先走 GUI，而 GUI 里又先交给 dsh-computer-use 的脚本（只有它知道
+ * 会话该落在哪个工作区，也只有它能把中文打进编辑框），脚本不行才点真实窗口里的「新会话」
+ * 按钮，两条 GUI 腿都不行才整条退回 API。
  *
  * 这一层存在的理由只有一个：把「这次用的是哪条路」变成结果里的一个字段。所以每个方法都返回
  * `source` 或 `transport`，并且在 API 调用失败时把原因放进 `warnings`——**不抛错、不静默降级**。
@@ -14,7 +16,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { dshHome, profileDir, profileName } from './paths.mjs'
 import { iconNameFromExe, quitViaTray, watcherGraceSeconds } from './graceful-quit.mjs'
 import { listSessionLogs, readLog, readProjection, summarizeFromDisk, summarizeFromProjection } from './sessionlog.mjs'
@@ -114,6 +116,21 @@ export function titleText(value) {
   return null
 }
 
+/**
+ * 从 cwd 里认出侧边栏上那个工作区行的名字。
+ *
+ * 脚本是按**工作区行的文字**找目标的（整行相等），而 `dsh_sessions create` 拿到的是绝对路径。
+ * 本机实测这两者就是同一个名字：`…\GitHub\xl-example` ↔ 侧边栏的 `xl-example`。认不出就返回
+ * null，让调用方回退到点全局「新会话」按钮那条腿，而不是拿一个猜出来的名字去点。
+ * @param {string|undefined} cwd - 绝对路径。
+ * @returns {string|null} 工作区名。
+ */
+export function workspaceLabel(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') return null
+  const name = basename(cwd.trim().replace(/[\\/]+$/, ''))
+  return name === '' ? null : name
+}
+
 /** 把 tokenMeter 的测量结果压成总量，不把逐节点数组塞进上下文。 */
 function trimUsage(usage) {
   if (usage === null || usage === undefined || typeof usage !== 'object') return usage ?? null
@@ -151,7 +168,7 @@ export function probe(ctx) {
 
   const tools = get(ctx, 'tools')
   const computerTools = []
-  for (const candidate of ['computer_env', 'computer_screen', 'computer_window', 'computer_locate', 'computer_mouse', 'computer_keyboard']) {
+  for (const candidate of ['computer_env', 'computer_screen', 'computer_window', 'computer_locate', 'computer_mouse', 'computer_keyboard', 'computer_script']) {
     try {
       if (typeof tools?.get === 'function' && tools.get(candidate) !== undefined) computerTools.push(candidate)
     } catch { /* 探测失败就当没有 */ }
@@ -169,7 +186,10 @@ export function probe(ctx) {
         channel: 'computer_* tools',
         available: computerTools.length > 0,
         evidence: computerTools.length > 0
-          ? `同进程已注册：${computerTools.join(', ')}（dsh-computer-use）`
+          ? `同进程已注册：${computerTools.join(', ')}（dsh-computer-use）` +
+            (computerTools.includes('computer_script')
+              ? `；建会话的 GUI 腿会用 computer_script 跑 scripts/${config.create.scriptName}.mjs`
+              : '；没有 computer_script，建会话的 GUI 腿只能点全局「新会话」按钮')
           : '同进程没有 computer_* 工具；需要桌面自动化时用本插件自己的 dsh_ui',
       },
     ],
@@ -239,6 +259,27 @@ export function adapter(ctx, config, deps = {}) {
   const savePlan = typeof deps.writePlan === 'function' ? deps.writePlan : writePlan
   const later = typeof deps.later === 'function' ? deps.later : (fn, ms) => setTimeout(fn, ms)
   const clock = typeof deps.now === 'function' ? deps.now : () => Date.now()
+  // 「叫 dsh-computer-use 跑脚本」也是一个副作用入口，所以同样可替换：测试要能在不碰这台机器的
+  // 前提下走完同一条代码路径。默认实现走同进程的工具注册表——这是「直接让 dsh-computer-use
+  // 执行脚本」的字面意思，不另起进程，也不复制一份它的实现。
+  const runComputerScript =
+    typeof deps.runComputerScript === 'function'
+      ? deps.runComputerScript
+      : async (spec) => {
+          const tools = get(ctx, 'tools')
+          if (tools === ABSENT || typeof tools?.get !== 'function') {
+            throw new Error('ctx.get("tools") 不可用：叫不动 dsh-computer-use')
+          }
+          const tool = tools.get('computer_script')
+          if (tool === undefined || tool === null) {
+            throw new Error('同进程没有 computer_script 工具：dsh-computer-use 没有安装或没有启用')
+          }
+          if (typeof tool.execute !== 'function') throw new Error('computer_script 工具上没有 execute')
+          return tool.execute(
+            { action: 'run', name: spec.name, dir: spec.dir, args: spec.args, timeoutMs: spec.timeoutMs },
+            { cwd: spec.cwd },
+          )
+        }
   /**
    * 建一次会话目录索引。
    *
@@ -622,7 +663,113 @@ export function adapter(ctx, config, deps = {}) {
     },
 
     /**
-     * GUI 路：点 DSH 自己的「新会话」，等它出现在会话列表里，再把第一条消息送进输入框。
+     * GUI 路之一（优先）：整件事交给 dsh-computer-use 的脚本。
+     *
+     * 与点按钮那条腿的差别不是「点得更准」，而是**它知道会话该落在哪个工作区**：脚本在侧边栏
+     * 里按整行文字找到那个工作区行，悬停后靠图片模板认出这一行的 `+`，点开，再把第一条消息打进
+     * 编辑框、读回确认、回车。中文因此进得去——本插件自己那条 SendKeys 路在这台机器上做不到。
+     *
+     * 代价是它对侧边栏有要求：列表里必须找得到那一行，找不到就明确失败，绝不改点别处。没有 cwd
+     * 时(`skipped`)直接让位给点按钮那条腿，不当成失败。
+     *
+     * 检测仍然用集合差：脚本前后各读一次会话列表。脚本报的 `sent` 只说「字进去了、回车了」，
+     * **会话是不是真的建出来了，只有列表说了算**，两者都对才算成功。
+     * @param {object} args - `{ text, cwd, title }`。
+     * @param {string[]} warnings - 警告收集器。
+     * @returns {Promise<object>} `{ ok, reason, skipped?, evidence?, sessionId? }`。
+     */
+    async createSessionViaScript(args, warnings) {
+      if (process.platform !== 'win32') {
+        return { ok: false, skipped: true, reason: `桌面通道只在 Windows 上可用（当前平台 ${process.platform}）` }
+      }
+      const workspace = workspaceLabel(args.cwd)
+      if (workspace === null) {
+        return { ok: false, skipped: true, reason: '没有 cwd，认不出要在哪个工作区建会话' }
+      }
+
+      const before = await attempt('listSessions(before-script)', warnings, () =>
+        this.listSessions({ workspace: 'all', limit: 500, enrich: false }),
+      )
+      if (!Array.isArray(before)) {
+        return { ok: false, reason: '会话列表读不出来，无法确认脚本是否真的建了会话' }
+      }
+      const known = new Set(before.map((row) => row.sessionId))
+
+      const run = await attempt('computer_script.run', warnings, () =>
+        runComputerScript({
+          name: config.create.scriptName,
+          dir: config.create.scriptDir,
+          args: { workspace, text: args.text },
+          timeoutMs: config.create.scriptTimeoutMs,
+          cwd: config.create.scriptDir,
+        }),
+      )
+      if (run === null || run?.ok !== true) {
+        const why = run?.error?.message ?? (run === null ? '调用没有返回结果' : '脚本报告失败')
+        return {
+          ok: false,
+          reason: `脚本「${config.create.scriptName}」没有跑通：${why}`,
+          evidence: { workspace, script: config.create.scriptName, logs: run?.logs ?? null, error: run?.error ?? null },
+        }
+      }
+
+      const returned = run.returned ?? null
+      if (returned?.sent !== true) {
+        return {
+          ok: false,
+          reason: `脚本跑完了，但它没有确认第一条消息发出去（returned.sent = ${JSON.stringify(returned?.sent ?? null)}）`,
+          evidence: { workspace, returned, logs: run.logs ?? null },
+        }
+      }
+
+      const detected = await this.waitForNewSession(known, config.create.waitMs, warnings)
+      if (detected === null) {
+        return {
+          ok: false,
+          reason: `脚本把消息发了出去，但 ${config.create.waitMs}ms 内没有新会话出现在列表里`,
+          evidence: { workspace, returned, sessionsBefore: before.length },
+        }
+      }
+
+      // 名字与工作区归属仍然由 API 补：GUI 只负责把会话造出来，这两件事它有 API 可用。
+      const titleResult = args.title === undefined ? null : await attempt('rename(script-created)', warnings, () => this.renameSession({ sessionId: detected.sessionId, title: args.title }))
+      const cwdResult = args.cwd === undefined ? null : await attempt('workspaceRegistry.attach(script-created)', warnings, async () => {
+        const workspaces = get(ctx, 'workspaceRegistry')
+        if (typeof workspaces?.create !== 'function') return null
+        const workspaceHandle = await workspaces.create(args.cwd)
+        return workspaceHandle.attachSession(detected.sessionId)
+      })
+
+      return {
+        ok: true,
+        transport: 'ui',
+        method: 'computer-script',
+        sessionId: detected.sessionId,
+        cwd: detected.cwd ?? args.cwd ?? null,
+        title: args.title ?? null,
+        firstMessage: 'ui',
+        workspace,
+        detectedBy: detected.detectedBy,
+        waitedMs: detected.waitedMs,
+        evidence: {
+          script: { name: config.create.scriptName, dir: config.create.scriptDir },
+          workspace,
+          row: returned.row ?? null,
+          plus: returned.plus ?? null,
+          steps: run.stepCount ?? null,
+          timeline: returned.timeline ?? null,
+          sessionsBefore: before.length,
+          title: titleResult,
+          cwd: cwdResult,
+        },
+        warnings: [],
+      }
+    },
+
+    /**
+     * GUI 路，两条腿：先交给脚本（知道会话该落在哪个工作区，中文也进得去），再点 DSH 自己的
+     * 「新会话」按钮。两条腿都会等新会话出现在会话列表里；第一条消息则按 `submitInGui` 决定在
+     * GUI 里敲还是交给 API。
      *
      * 检测用的是**集合差**（点之前有哪些会话 id，点之后多了哪一个），不是「找一条空会话」：
      * 列表里有历史遗留的空会话是常态，靠 `blank` 认领会认错人。检测走 `listSessions`，
@@ -635,6 +782,18 @@ export function adapter(ctx, config, deps = {}) {
       if (process.platform !== 'win32') {
         return { ok: false, reason: `桌面通道只在 Windows 上可用（当前平台 ${process.platform}）` }
       }
+
+      // 顺序是先脚本、后按钮。差别在 cwd：给了 cwd 时脚本能把会话落进**指定的那个工作区**，
+      // 顺便把第一条消息（含中文）真的打进编辑框；没给 cwd 时脚本认不出目标，直接让位。
+      // 脚本失败也不退 API——下面那条腿同样是 GUI。
+      if (config.create.useScript !== false) {
+        const viaScript = await this.createSessionViaScript(args, warnings)
+        if (viaScript.ok === true) return viaScript
+        if (viaScript.skipped !== true) {
+          warnings.push(`脚本建会话失败，改用「新会话」按钮：${viaScript.reason}`)
+        }
+      }
+
       const window = await attempt('ui.window', warnings, () => desktop('window', {}, config, { timeoutMs: 20_000 }))
       if (window === null || window?.ok !== true || window?.target === undefined) {
         return { ok: false, reason: `找不到可操作的 DSH 窗口（${window?.reason ?? 'window 动作没有返回目标'}）`, evidence: { window } }

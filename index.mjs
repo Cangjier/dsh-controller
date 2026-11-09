@@ -156,6 +156,16 @@ export function normalizeConfig(raw) {
       // 输入框里可能还留着上一次的话。默认 false 时 `text` 只能走 API；要试 GUI 送字就打开它，
       // 脚本会在有草稿或非 ASCII 时明确拒绝（`composer-not-empty` / `text-not-ascii`）。
       submitInGui: optionalBoolean(create, 'submitInGui', false, 'config.create.submitInGui'),
+      // 建会话的 GUI 腿优先交给 dsh-computer-use 的脚本，而不是点全局「新会话」按钮。
+      // 差的不只是「点得更准」：脚本按文字找到**指定工作区**那一行、悬停后靠图片模板认出它的
+      // `+`、点开、再把第一条消息打进编辑框并读回确认。于是会话落在要它落的工作区里，而且中文
+      // 真的进得去——本插件自己那条 SendKeys 路在这台机器上做不到（见上面 submitInGui 的注释）。
+      // 脚本放在本仓库的 scripts/ 下，由 dsh-computer-use 的 computer_script 执行（它支持 dir
+      // 指到项目旁边，正是「场景跟着它驱动的项目走」这个用法）。
+      useScript: optionalBoolean(create, 'useScript', true, 'config.create.useScript'),
+      scriptDir: optionalString(create, 'scriptDir', null, 'config.create.scriptDir') ?? resolve(HERE, 'scripts'),
+      scriptName: optionalString(create, 'scriptName', 'dsh-new-conversation', 'config.create.scriptName'),
+      scriptTimeoutMs: optionalPositiveNumber(create, 'scriptTimeoutMs', 60_000, 'config.create.scriptTimeoutMs'),
     },
     ui: {
       windowTitle: optionalString(ui, 'windowTitle', null, 'config.ui.windowTitle'),
